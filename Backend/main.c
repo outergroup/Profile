@@ -280,7 +280,7 @@ static bool sb_append_binary_header(StringBuilder *builder, uint32_t type) {
 }
 
 static void send_outer_descriptor(int fd) {
-    const char *plugin_payload = "{\"processesAPIPath\":\"/api/processes\",\"profileAPIPath\":\"/api/profile\",\"profileStartAPIPath\":\"/api/profile/start\",\"profileStopAPIPath\":\"/api/profile/stop\",\"profileStatusAPIPath\":\"/api/profile/status\",\"profileListAPIPath\":\"/api/profiles\",\"profileRangeAPIPath\":\"/api/profile/range\"}";
+    const char *plugin_payload = "{\"processesAPIPath\":\"/api/processes\",\"profileAPIPath\":\"/api/profile\",\"profileStartAPIPath\":\"/api/profile/start\",\"profileStopAPIPath\":\"/api/profile/stop\",\"profileStatusAPIPath\":\"/api/profile/status\",\"profileListAPIPath\":\"/api/profiles\",\"profileRangeAPIPath\":\"/api/profile/range\",\"profileDeleteAPIPath\":\"/api/profile/delete\"}";
     size_t path_len = strlen(kBundleUrlPath);
     size_t plugin_len = strlen(plugin_payload);
     size_t header_len = 40;
@@ -557,6 +557,21 @@ static ProfileRun *profile_store_find(uint64_t id) {
 static ProfileRun *profile_store_latest(void) {
     if (g_profiles.count == 0) return NULL;
     return &g_profiles.items[g_profiles.count - 1];
+}
+
+static bool profile_store_delete(uint64_t id) {
+    for (size_t i = 0; i < g_profiles.count; i++) {
+        if (g_profiles.items[i].id != id) continue;
+        profile_run_free(&g_profiles.items[i]);
+        if (i + 1 < g_profiles.count) {
+            memmove(&g_profiles.items[i],
+                    &g_profiles.items[i + 1],
+                    (g_profiles.count - i - 1) * sizeof(ProfileRun));
+        }
+        g_profiles.count--;
+        return true;
+    }
+    return false;
 }
 
 static bool profile_store_append(ProfileRun run) {
@@ -1567,6 +1582,29 @@ static void send_profile_range(int fd, const char *query) {
 #endif
 }
 
+static void send_profile_delete(int fd, const char *query) {
+#ifndef __linux__
+    (void)query;
+    send_text_response(fd, 500, "Linux perf profiling is only available on Linux.\n");
+#else
+    char value[64];
+    if (!query_value(query, "profileID", value, sizeof(value))) {
+        send_text_response(fd, 400, "missing profileID\n");
+        return;
+    }
+    uint64_t profile_id = strtoull(value, NULL, 10);
+    if (profile_id == 0) {
+        send_text_response(fd, 400, "invalid profileID\n");
+        return;
+    }
+    if (!profile_store_delete(profile_id)) {
+        send_text_response(fd, 404, "profile not found\n");
+        return;
+    }
+    send_profile_list_binary(fd);
+#endif
+}
+
 static void handle_client(int fd) {
     char buffer[READ_BUFFER_SIZE + 1];
     ssize_t got = read(fd, buffer, READ_BUFFER_SIZE);
@@ -1609,6 +1647,8 @@ static void handle_client(int fd) {
         send_profile_list_binary(fd);
     } else if (strcmp(target, "/api/profile/range") == 0) {
         send_profile_range(fd, query ? query : "");
+    } else if (strcmp(target, "/api/profile/delete") == 0) {
+        send_profile_delete(fd, query ? query : "");
     } else {
         send_text_response(fd, 404, "not found\n");
     }

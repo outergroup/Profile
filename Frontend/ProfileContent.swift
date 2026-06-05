@@ -1,4 +1,5 @@
 import AppKit
+import CoreText
 import Foundation
 import QuartzCore
 
@@ -350,6 +351,15 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     private let toolbarLayer = CALayer()
     private let sidebarLayer = CALayer()
     private let processListLayer = CALayer()
+    private let processChromeLayer = CALayer()
+    private let processSearchLayer = CALayer()
+    private let processSearchTextLayer = CATextLayer()
+    private let processSearchPlaceholderLayer = CATextLayer()
+    private let processSearchSelectionLayer = CALayer()
+    private let processSearchCursorLayer = CALayer()
+    private let processViewportLayer = CALayer()
+    private let processContentLayer = CALayer()
+    private let processScrollbarLayer = CALayer()
     private let timelineLayer = CALayer()
     private let flameLayer = CALayer()
     private let flameDecorationLayer = CALayer()
@@ -371,6 +381,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     private var profileStopEndpoint: URL?
     private var profileListEndpoint: URL?
     private var profileRangeEndpoint: URL?
+    private var profileDeleteEndpoint: URL?
     private var hasRegisteredLayer = false
 
     private var traces: [ProfileSummary] = []
@@ -378,9 +389,17 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     private var selectedTraceID: UInt64?
     private var selectedPID: Int?
     private var processScroll: CGFloat = 0
+    private var processSearchText = ""
+    private var processSearchCursorPosition = 0
+    private var processSearchSelectionAnchor: Int?
+    private var processSearchFocused = false
+    private var filteredProcessIndices: [Int] = []
     private var showingSetup = true
     private var isBusy = false
     private var isRecording = false
+    private var activeRecordingID: UInt64?
+    private var activeRecordingPID: Int?
+    private var activeRecordingFrequency: Int?
     private var recordingStartedAt: Date?
     private var isFetchingRange = false
     private var lastProfile: ProfileResponse?
@@ -394,6 +413,8 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     private var flameZoom: CGFloat = 1
     private var flameLaidOutZoom: CGFloat = 1
     private var flameContentSize = CGSize.zero
+    private var traceContextMenuTargets: [UUID: UInt64] = [:]
+    private var processSearchContextMenuIDs: Set<UUID> = []
 
     private let toolbarHeight: CGFloat = 52
     private let sidebarWidth: CGFloat = 240
@@ -401,6 +422,8 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     private let rowHeight: CGFloat = 30
     private let runRowHeight: CGFloat = 56
     private let horizontalInset: CGFloat = 14
+    private static let processSearchFieldID = UUID()
+    private let processSearchCaretBlinkAnimationKey = "processSearchCaretBlink"
 
     init(outerframeHost: OuterframeHost, appConnection: OuterframeAppConnection) {
         self.outerframeHost = outerframeHost
@@ -443,7 +466,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             if showingSetup, processListLayer.frame.contains(point) {
                 processScroll -= delta.y * multiplier
                 clampProcessScroll()
-                updateProcessRows()
+                updateProcessScrollPosition()
             } else if !showingSetup, flameLayer.frame.contains(point) {
                 flameHorizontalScroll -= delta.x * multiplier
                 flameVerticalScroll -= delta.y * multiplier
@@ -472,6 +495,49 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         case .mouseMoved(let point, _):
             handleMouseMoved(at: point)
 
+        case .keyDown(let keyCode, let characters, let charactersIgnoringModifiers, let modifierFlags, let isARepeat):
+            handleKeyDown(keyCode: keyCode,
+                          characters: characters,
+                          charactersIgnoringModifiers: charactersIgnoringModifiers,
+                          modifierFlags: modifierFlags,
+                          isARepeat: isARepeat)
+
+        case .textInput(let text, let hasReplacementRange, let replacementLocation, let replacementLength):
+            handleTextInput(text,
+                            hasReplacementRange: hasReplacementRange,
+                            replacementLocation: replacementLocation,
+                            replacementLength: replacementLength)
+
+        case .textCommand(let command):
+            handleTextCommand(command)
+
+        case .textInputFocus(let fieldID, let hasFocus):
+            handleTextInputFocus(fieldID: fieldID, hasFocus: hasFocus)
+
+        case .setCursorPosition(let fieldID, let position, let modifySelection):
+            handleSetCursorPosition(fieldID: fieldID, position: position, modifySelection: modifySelection)
+
+        case .rightMouseDown(let point, _, _):
+            handleRightMouseDown(at: point)
+
+        case .contextMenuItemSelected(let menuID, let itemID):
+            handleContextMenuSelection(menuID: menuID, itemID: itemID)
+
+        case .selectionToPasteboardCopyRequest(let requestID):
+            outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
+                                                              items: processSearchPasteboardItems())
+
+        case .selectionToPasteboardCutRequest(let requestID):
+            let items = processSearchPasteboardItems()
+            outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
+                                                              items: items)
+            if !items.isEmpty {
+                deleteProcessSearchSelection()
+            }
+
+        case .pasteboardContentPasted(let items):
+            insertProcessSearchPasteboardItems(items)
+
         case .accessibilitySnapshotRequest(let requestID):
             outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID, snapshot: nil)
 
@@ -494,6 +560,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         profileStopEndpoint = URL(string: "/api/profile/stop", relativeTo: base)?.absoluteURL
         profileListEndpoint = URL(string: "/api/profiles", relativeTo: base)?.absoluteURL
         profileRangeEndpoint = URL(string: "/api/profile/range", relativeTo: base)?.absoluteURL
+        profileDeleteEndpoint = URL(string: "/api/profile/delete", relativeTo: base)?.absoluteURL
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 180
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
@@ -512,6 +579,12 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         rootLayer.addSublayer(statusLayer)
         rootLayer.addSublayer(tooltipLayer)
 
+        processListLayer.addSublayer(processChromeLayer)
+        processListLayer.addSublayer(processViewportLayer)
+        processListLayer.addSublayer(processScrollbarLayer)
+        processViewportLayer.masksToBounds = true
+        processViewportLayer.addSublayer(processContentLayer)
+
         flameLayer.addSublayer(flameDecorationLayer)
         flameLayer.addSublayer(flameViewportLayer)
         flameLayer.addSublayer(flameScrollbarLayer)
@@ -522,8 +595,23 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         flameTextOverlayLayer.anchorPoint = .zero
 
         toolbarLayer.addSublayer(refreshButtonLayer)
-        toolbarLayer.addSublayer(recordToggleButtonLayer)
         refreshButtonLayer.addSublayer(makeButtonLabel("Refresh"))
+
+        processSearchLayer.addSublayer(makeSymbolLayer("magnifyingglass", color: .secondaryLabelColor))
+        processSearchLayer.addSublayer(processSearchSelectionLayer)
+        processSearchLayer.addSublayer(processSearchPlaceholderLayer)
+        processSearchLayer.addSublayer(processSearchTextLayer)
+        processSearchLayer.addSublayer(processSearchCursorLayer)
+        processSearchPlaceholderLayer.font = NSFont.systemFont(ofSize: 13, weight: .regular)
+        processSearchPlaceholderLayer.fontSize = 13
+        processSearchPlaceholderLayer.contentsScale = 2
+        processSearchPlaceholderLayer.truncationMode = .end
+        processSearchPlaceholderLayer.string = "Search processes"
+        processSearchTextLayer.font = NSFont.systemFont(ofSize: 13, weight: .regular)
+        processSearchTextLayer.fontSize = 13
+        processSearchTextLayer.contentsScale = 2
+        processSearchTextLayer.truncationMode = .end
+        processSearchCursorLayer.cornerRadius = 0.5
 
         statusLayer.font = NSFont.systemFont(ofSize: 13, weight: .regular)
         statusLayer.fontSize = 13
@@ -559,13 +647,21 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             toolbarLayer.backgroundColor = toolbarColor.cgColor
             sidebarLayer.backgroundColor = sidebarBackgroundColor.cgColor
             processListLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
+            processSearchLayer.backgroundColor = searchFieldBackgroundColor.cgColor
+            processSearchLayer.borderColor = (processSearchFocused ? NSColor.keyboardFocusIndicatorColor : NSColor.separatorColor).cgColor
+            processSearchLayer.borderWidth = processSearchFocused ? 1.5 : 1
+            processSearchPlaceholderLayer.foregroundColor = NSColor.placeholderTextColor.cgColor
+            processSearchTextLayer.foregroundColor = NSColor.labelColor.cgColor
+            processSearchSelectionLayer.backgroundColor = NSColor.selectedTextBackgroundColor.withAlphaComponent(isDarkMode ? 0.58 : 0.42).cgColor
+            processSearchCursorLayer.backgroundColor = NSColor.labelColor.cgColor
             timelineLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
             flameLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
             statusLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
             tooltipLayer.backgroundColor = tooltipBackgroundColor.cgColor
             tooltipLayer.borderColor = NSColor.separatorColor.cgColor
             tooltipTextLayer.foregroundColor = NSColor.labelColor.cgColor
-            styleButton(refreshButtonLayer, enabled: !isBusy && !isRecording)
+            refreshButtonLayer.isHidden = !showingSetup
+            styleButton(refreshButtonLayer, enabled: showingSetup && !isBusy && !isRecording)
             styleRecordButton()
         }
         updateSidebar()
@@ -588,15 +684,20 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         let contentHeight = max(height - toolbarHeight, 1)
         let contentWidth = max(width - contentX, 1)
         processListLayer.frame = CGRect(x: contentX, y: 0, width: contentWidth, height: contentHeight)
+        processChromeLayer.frame = processListLayer.bounds
+        processScrollbarLayer.frame = processListLayer.bounds
         timelineLayer.frame = CGRect(x: contentX,
                                      y: max(contentHeight - timelineHeight, 0),
                                      width: contentWidth,
                                      height: min(timelineHeight, contentHeight))
         flameLayer.frame = CGRect(x: contentX, y: 0, width: contentWidth, height: max(contentHeight - timelineLayer.frame.height, 1))
 
-        recordToggleButtonLayer.frame = CGRect(x: horizontalInset, y: 11, width: 36, height: 30)
-        refreshButtonLayer.frame = CGRect(x: 58, y: 11, width: 84, height: 30)
-        statusLayer.frame = CGRect(x: contentX + 158, y: height - 35, width: max(width - contentX - 174, 1), height: 18)
+        recordToggleButtonLayer.frame = CGRect(x: sidebarWidth - 50, y: height - toolbarHeight + 11, width: 34, height: 30)
+        refreshButtonLayer.frame = CGRect(x: horizontalInset, y: 11, width: 84, height: 30)
+        refreshButtonLayer.isHidden = !showingSetup
+        let statusX = showingSetup ? contentX + 112 : contentX + horizontalInset
+        let statusRightInset: CGFloat = showingSetup ? 16 : horizontalInset
+        statusLayer.frame = CGRect(x: statusX, y: height - 35, width: max(width - statusX - statusRightInset, 1), height: 18)
         refreshButtonLayer.sublayers?.first?.frame = refreshButtonLayer.bounds.insetBy(dx: 10, dy: 6)
         CATransaction.commit()
 
@@ -610,25 +711,22 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
 
     private func handleMouseDown(at point: CGPoint) {
         let toolbarPoint = toolbarLayer.convert(point, from: rootLayer)
-        if recordToggleButtonLayer.frame.contains(toolbarPoint), !isBusy {
-            if isRecording {
-                stopRecording()
-            } else {
-                startRecording()
-            }
-            return
-        }
-        if refreshButtonLayer.frame.contains(toolbarPoint), !isBusy, !isRecording {
-            if showingSetup {
-                fetchProcesses()
-            } else {
-                fetchProfiles(selectLatestIfNeeded: false)
-            }
+        if showingSetup, refreshButtonLayer.frame.contains(toolbarPoint), !isBusy, !isRecording {
+            fetchProcesses()
             return
         }
 
         if sidebarLayer.frame.contains(point) {
-            handleSidebarClick(at: sidebarLayer.convert(point, from: rootLayer))
+            let sidebarPoint = sidebarLayer.convert(point, from: rootLayer)
+            if recordToggleButtonLayer.frame.contains(sidebarPoint), !isBusy {
+                if isRecording {
+                    stopRecording()
+                } else {
+                    startRecording()
+                }
+                return
+            }
+            handleSidebarClick(at: sidebarPoint)
             return
         }
 
@@ -644,20 +742,26 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
 
         guard showingSetup, !isRecording else { return }
         let listPoint = processListLayer.convert(point, from: rootLayer)
+        if processSearchFrame().contains(listPoint) {
+            focusProcessSearch(cursorPosition: processSearchCursorPosition(at: listPoint), modifySelection: false)
+            return
+        }
+        if processListLayer.bounds.contains(listPoint), !processSearchFrame().contains(listPoint) {
+            blurProcessSearch()
+        }
         let listFrame = processTableFrame()
         guard listFrame.contains(listPoint) else { return }
-        let visibleStart = max(Int(floor(processScroll / rowHeight)), 0)
-        let index = visibleStart + Int(floor((listFrame.maxY - listPoint.y) / rowHeight))
-        if processes.indices.contains(index) {
-            selectedPID = processes[index].pid
-            statusLayer.string = "Next recording target: \(processes[index].name) (\(processes[index].pid))."
+        let filteredIndex = Int(floor((listFrame.maxY - listPoint.y + processScroll) / rowHeight))
+        if filteredProcessIndices.indices.contains(filteredIndex) {
+            let process = processes[filteredProcessIndices[filteredIndex]]
+            selectedPID = process.pid
+            statusLayer.string = "Next recording target: \(process.name) (\(process.pid))."
             updateColors()
         }
     }
 
     private func handleSidebarClick(at point: CGPoint) {
-        let nextRect = CGRect(x: 10, y: sidebarLayer.bounds.height - 112, width: sidebarLayer.bounds.width - 20, height: runRowHeight - 8)
-        if nextRect.contains(point) {
+        if nextRecordingFrame().contains(point) {
             showingSetup = true
             selectedTraceID = nil
             lastProfile = nil
@@ -668,21 +772,76 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             return
         }
 
-        let runTop = sidebarLayer.bounds.height - 164
-        for index in traces.indices.reversed() {
-            let visualIndex = traces.count - 1 - index
-            let y = runTop - CGFloat(visualIndex + 1) * runRowHeight
-            let rect = CGRect(x: 10, y: y, width: sidebarLayer.bounds.width - 20, height: runRowHeight - 8)
-            if rect.contains(point) {
-                showingSetup = false
-                selectedTraceID = traces[index].profileID
-                selectedRange = nil
-                resetFlameViewport()
-                loadProfile(id: traces[index].profileID)
-                updateColors()
+        if let index = traceIndex(at: point) {
+            selectTrace(at: index)
+        }
+    }
+
+    private func handleRightMouseDown(at point: CGPoint) {
+        if showingSetup, processListLayer.frame.contains(point) {
+            let listPoint = processListLayer.convert(point, from: rootLayer)
+            if processSearchFrame().contains(listPoint) {
+                focusProcessSearch(cursorPosition: processSearchCursorPosition(at: listPoint), modifySelection: false)
+                showProcessSearchContextMenu(at: point)
                 return
             }
         }
+
+        guard sidebarLayer.frame.contains(point) else { return }
+        let sidebarPoint = sidebarLayer.convert(point, from: rootLayer)
+        guard let index = traceIndex(at: sidebarPoint) else { return }
+        let trace = traces[index]
+        let menuID = UUID()
+        traceContextMenuTargets[menuID] = trace.profileID
+        let items = [
+            OuterframeContextMenuItem(id: "delete",
+                                      title: "Delete Trace",
+                                      systemImageName: "trash")
+        ]
+        outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
+    }
+
+    private func handleContextMenuSelection(menuID: UUID, itemID: String) {
+        if processSearchContextMenuIDs.remove(menuID) != nil {
+            handleProcessSearchContextMenuSelection(itemID: itemID)
+            return
+        }
+
+        guard itemID == "delete",
+              let profileID = traceContextMenuTargets.removeValue(forKey: menuID) else { return }
+        deleteTrace(id: profileID)
+    }
+
+    private func traceIndex(at point: CGPoint) -> Int? {
+        for index in traces.indices.reversed() {
+            let visualIndex = traces.count - 1 - index
+            if traceFrame(visualIndex: visualIndex).contains(point) {
+                return index
+            }
+        }
+        return nil
+    }
+
+    private func nextRecordingFrame() -> CGRect {
+        CGRect(x: 10, y: sidebarLayer.bounds.height - 118, width: sidebarLayer.bounds.width - 20, height: runRowHeight - 4)
+    }
+
+    private func traceFrame(visualIndex: Int) -> CGRect {
+        let runTop = sidebarLayer.bounds.height - 170
+        let y = runTop - CGFloat(visualIndex + 1) * runRowHeight
+        return CGRect(x: 10, y: y, width: sidebarLayer.bounds.width - 20, height: runRowHeight - 8)
+    }
+
+    private func selectTrace(at index: Int) {
+        guard traces.indices.contains(index) else { return }
+        blurProcessSearch()
+        showingSetup = false
+        selectedTraceID = traces[index].profileID
+        lastProfile = nil
+        selectedRange = nil
+        resetFlameViewport()
+        loadProfile(id: traces[index].profileID)
+        updateColors()
     }
 
     private func handleMouseDragged(at point: CGPoint) {
@@ -725,6 +884,118 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             return
         }
         showTooltip(for: hit, at: point)
+    }
+
+    private func handleKeyDown(keyCode: UInt16,
+                               characters: String,
+                               charactersIgnoringModifiers: String,
+                               modifierFlags: NSEvent.ModifierFlags,
+                               isARepeat: Bool) {
+        _ = characters
+        _ = charactersIgnoringModifiers
+        _ = modifierFlags
+        _ = isARepeat
+        guard processSearchFocused else { return }
+        if modifierFlags.contains(.command) {
+            switch charactersIgnoringModifiers.lowercased() {
+            case "a":
+                selectAllProcessSearchText()
+            case "c":
+                writeProcessSearchSelectionToPasteboard(cut: false)
+            case "x":
+                writeProcessSearchSelectionToPasteboard(cut: true)
+            case "v":
+                readPasteboardIntoProcessSearch()
+            default:
+                break
+            }
+            return
+        }
+        if keyCode == 53 {
+            if processSearchText.isEmpty {
+                blurProcessSearch()
+            } else {
+                setProcessSearchText("")
+            }
+        }
+    }
+
+    private func handleTextInput(_ text: String,
+                                 hasReplacementRange: Bool,
+                                 replacementLocation: UInt64,
+                                 replacementLength: UInt64) {
+        guard processSearchFocused, !text.isEmpty else { return }
+        let replacement: Range<Int>?
+        if hasReplacementRange {
+            let location = min(Int(replacementLocation), processSearchText.count)
+            let length = min(Int(replacementLength), processSearchText.count - location)
+            replacement = location..<(location + length)
+        } else {
+            replacement = nil
+        }
+        insertProcessSearchText(text, replacementRange: replacement)
+    }
+
+    private func handleTextCommand(_ command: String) {
+        guard processSearchFocused else { return }
+        switch command.trimmingCharacters(in: CharacterSet(charactersIn: ":")) {
+        case "deleteBackward":
+            deleteProcessSearchBackward()
+        case "deleteForward":
+            deleteProcessSearchForward()
+        case "deleteWordBackward":
+            deleteProcessSearchWordBackward()
+        case "deleteWordForward":
+            deleteProcessSearchWordForward()
+        case "deleteToBeginningOfLine", "deleteToBeginningOfParagraph", "deleteToMark":
+            replaceProcessSearchText(range: 0..<processSearchCursorPosition, with: "")
+        case "deleteToEndOfLine", "deleteToEndOfParagraph":
+            replaceProcessSearchText(range: processSearchCursorPosition..<processSearchText.count, with: "")
+        case "moveLeft":
+            moveProcessSearchCursor(to: processSearchCursorPosition - 1, modifySelection: false, collapsingSelectionTowardStart: true)
+        case "moveRight":
+            moveProcessSearchCursor(to: processSearchCursorPosition + 1, modifySelection: false, collapsingSelectionTowardStart: false)
+        case "moveWordLeft":
+            moveProcessSearchCursor(to: previousProcessSearchWordBoundary(from: processSearchCursorPosition), modifySelection: false, collapsingSelectionTowardStart: true)
+        case "moveWordRight":
+            moveProcessSearchCursor(to: nextProcessSearchWordBoundary(from: processSearchCursorPosition), modifySelection: false, collapsingSelectionTowardStart: false)
+        case "moveToBeginningOfLine", "moveToBeginningOfDocument", "moveToBeginningOfParagraph", "moveToLeftEndOfLine":
+            moveProcessSearchCursor(to: 0, modifySelection: false)
+        case "moveToEndOfLine", "moveToEndOfDocument", "moveToEndOfParagraph", "moveToRightEndOfLine":
+            moveProcessSearchCursor(to: processSearchText.count, modifySelection: false)
+        case "moveLeftAndModifySelection":
+            moveProcessSearchCursor(to: processSearchCursorPosition - 1, modifySelection: true)
+        case "moveRightAndModifySelection":
+            moveProcessSearchCursor(to: processSearchCursorPosition + 1, modifySelection: true)
+        case "moveWordLeftAndModifySelection":
+            moveProcessSearchCursor(to: previousProcessSearchWordBoundary(from: processSearchCursorPosition), modifySelection: true)
+        case "moveWordRightAndModifySelection":
+            moveProcessSearchCursor(to: nextProcessSearchWordBoundary(from: processSearchCursorPosition), modifySelection: true)
+        case "moveToBeginningOfLineAndModifySelection", "moveToBeginningOfDocumentAndModifySelection", "moveToBeginningOfParagraphAndModifySelection", "moveToLeftEndOfLineAndModifySelection":
+            moveProcessSearchCursor(to: 0, modifySelection: true)
+        case "moveToEndOfLineAndModifySelection", "moveToEndOfDocumentAndModifySelection", "moveToEndOfParagraphAndModifySelection", "moveToRightEndOfLineAndModifySelection":
+            moveProcessSearchCursor(to: processSearchText.count, modifySelection: true)
+        case "selectAll":
+            selectAllProcessSearchText()
+        case "insertNewline", "cancelOperation":
+            blurProcessSearch()
+        default:
+            break
+        }
+    }
+
+    private func handleTextInputFocus(fieldID: UUID, hasFocus: Bool) {
+        guard fieldID == Self.processSearchFieldID else { return }
+        if hasFocus {
+            focusProcessSearch(cursorPosition: processSearchCursorPosition, modifySelection: false)
+        } else {
+            blurProcessSearch()
+        }
+    }
+
+    private func handleSetCursorPosition(fieldID: UUID, position: UInt64, modifySelection: Bool) {
+        guard fieldID == Self.processSearchFieldID else { return }
+        focusProcessSearch(cursorPosition: min(Int(position), processSearchText.count), modifySelection: modifySelection)
     }
 
     private func setDraggingRange(end: Double) {
@@ -815,13 +1086,21 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
                 if let result {
                     self.traces = result.profiles
                     self.isRecording = result.recording
-                    if selectLatestIfNeeded, self.selectedTraceID == nil, let latest = result.profiles.last {
+                    self.activeRecordingID = result.recording ? result.recordingID : nil
+                    if result.recording, self.selectedTraceID == nil {
+                        self.showingSetup = false
+                        self.selectedTraceID = result.recordingID
+                        self.lastProfile = nil
+                        self.selectedRange = nil
+                        self.statusLayer.string = "Recording..."
+                    } else if selectLatestIfNeeded, self.selectedTraceID == nil, let latest = result.profiles.last {
                         self.showingSetup = false
                         self.selectedTraceID = latest.profileID
                         self.resetFlameViewport()
                         self.loadProfile(id: latest.profileID)
                     } else if let selectedTraceID = self.selectedTraceID,
-                              !self.traces.contains(where: { $0.profileID == selectedTraceID }) {
+                              !self.traces.contains(where: { $0.profileID == selectedTraceID }) &&
+                              selectedTraceID != self.activeRecordingID {
                         self.selectedTraceID = nil
                         self.showingSetup = true
                     }
@@ -876,7 +1155,16 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
                 self.isBusy = false
                 if let decoded {
                     self.isRecording = decoded.recording
+                    self.activeRecordingID = decoded.recordingID
+                    self.activeRecordingPID = decoded.pid
+                    self.activeRecordingFrequency = decoded.frequency
                     self.recordingStartedAt = Date()
+                    self.showingSetup = false
+                    self.selectedTraceID = decoded.recordingID
+                    self.lastProfile = nil
+                    self.selectedRange = nil
+                    self.resetFlameViewport()
+                    self.blurProcessSearch()
                     self.statusLayer.string = "Recording pid \(decoded.pid) at \(decoded.frequency) Hz..."
                 } else {
                     self.statusLayer.string = error?.localizedDescription ?? "Recording failed (\(status)): \(body)"
@@ -899,6 +1187,9 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
                 guard let self else { return }
                 self.isBusy = false
                 self.isRecording = false
+                self.activeRecordingID = nil
+                self.activeRecordingPID = nil
+                self.activeRecordingFrequency = nil
                 self.recordingStartedAt = nil
                 if let decoded {
                     self.lastProfile = decoded
@@ -939,6 +1230,56 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
                     self.statusLayer.string = error?.localizedDescription ?? "Load failed (\(status)): \(body)"
                 }
                 self.updateColors()
+            }
+        }.resume()
+    }
+
+    private func deleteTrace(id: UInt64) {
+        guard let profileDeleteEndpoint, let urlSession else { return }
+        var components = URLComponents(url: profileDeleteEndpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "profileID", value: String(id))]
+        guard let url = components?.url else { return }
+
+        let deletedSelectedTrace = selectedTraceID == id
+        statusLayer.string = "Deleting recording..."
+        urlSession.dataTask(with: url) { [weak self] data, response, error in
+            let result = data.flatMap(ProfileBinary.decodeProfileList)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+            Task { @MainActor in
+                guard let self else { return }
+                if let result {
+                    self.traces = result.profiles
+                    self.isRecording = result.recording
+                    self.activeRecordingID = result.recording ? result.recordingID : nil
+                    if deletedSelectedTrace {
+                        if let replacement = result.profiles.last {
+                            self.showingSetup = false
+                            self.selectedTraceID = replacement.profileID
+                            self.lastProfile = nil
+                            self.selectedRange = nil
+                            self.resetFlameViewport()
+                            self.loadProfile(id: replacement.profileID)
+                        } else {
+                            self.showingSetup = true
+                            self.selectedTraceID = nil
+                            self.lastProfile = nil
+                            self.selectedRange = nil
+                            self.statusLayer.string = "Choose a process for the next recording."
+                        }
+                    } else if let selectedTraceID = self.selectedTraceID,
+                              !result.profiles.contains(where: { $0.profileID == selectedTraceID }) {
+                        self.showingSetup = true
+                        self.selectedTraceID = nil
+                        self.lastProfile = nil
+                        self.selectedRange = nil
+                    } else {
+                        self.statusLayer.string = "Deleted recording."
+                    }
+                    self.updateColors()
+                } else {
+                    self.statusLayer.string = error?.localizedDescription ?? "Delete failed (\(status)): \(body)"
+                }
             }
         }.resume()
     }
@@ -997,11 +1338,11 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             let title = makeTextLayer(size: 12, weight: .semibold)
             title.string = "PROFILE"
             title.foregroundColor = NSColor.secondaryLabelColor.cgColor
-            title.frame = CGRect(x: 16, y: sidebarLayer.bounds.height - 32, width: sidebarLayer.bounds.width - 32, height: 16)
+            title.frame = CGRect(x: 16, y: sidebarLayer.bounds.height - 32, width: max(sidebarLayer.bounds.width - 72, 1), height: 16)
             sidebarLayer.addSublayer(title)
+            sidebarLayer.addSublayer(recordToggleButtonLayer)
 
-            let nextFrame = CGRect(x: 10, y: sidebarLayer.bounds.height - 112, width: sidebarLayer.bounds.width - 20, height: runRowHeight - 8)
-            sidebarLayer.addSublayer(makeSidebarRow(frame: nextFrame,
+            sidebarLayer.addSublayer(makeSidebarRow(frame: nextRecordingFrame(),
                                                     title: "Next Recording",
                                                     subtitle: selectedProcessSubtitle,
                                                     iconName: "record.circle",
@@ -1010,18 +1351,28 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             let runs = makeTextLayer(size: 12, weight: .semibold)
             runs.string = "TRACES"
             runs.foregroundColor = NSColor.secondaryLabelColor.cgColor
-            runs.frame = CGRect(x: 16, y: sidebarLayer.bounds.height - 146, width: sidebarLayer.bounds.width - 32, height: 16)
+            runs.frame = CGRect(x: 16, y: sidebarLayer.bounds.height - 152, width: sidebarLayer.bounds.width - 32, height: 16)
             sidebarLayer.addSublayer(runs)
 
-            let runTop = sidebarLayer.bounds.height - 164
+            var extraTraceRows = 0
+            if isRecording, let activeRecordingID, !traces.contains(where: { $0.profileID == activeRecordingID }) {
+                let subtitle = activeRecordingPID.map { "pid \($0)  Recording" } ?? "Recording"
+                sidebarLayer.addSublayer(makeSidebarRow(frame: traceFrame(visualIndex: 0),
+                                                        title: "Recording",
+                                                        subtitle: subtitle,
+                                                        iconName: "chart.bar.fill",
+                                                        selected: selectedTraceID == activeRecordingID))
+                extraTraceRows = 1
+            }
+
             for index in traces.indices.reversed() {
-                let visualIndex = traces.count - 1 - index
-                let y = runTop - CGFloat(visualIndex + 1) * runRowHeight
-                guard y + runRowHeight > 0 else { continue }
+                let visualIndex = traces.count - 1 - index + extraTraceRows
+                let frame = traceFrame(visualIndex: visualIndex)
+                guard frame.maxY > 0 else { continue }
                 let trace = traces[index]
                 let title = "Run \(index + 1)"
                 let subtitle = "pid \(trace.pid)  \(formatDuration(trace.duration))"
-                sidebarLayer.addSublayer(makeSidebarRow(frame: CGRect(x: 10, y: y, width: sidebarLayer.bounds.width - 20, height: runRowHeight - 8),
+                sidebarLayer.addSublayer(makeSidebarRow(frame: frame,
                                                         title: title,
                                                         subtitle: subtitle,
                                                         iconName: "chart.bar.fill",
@@ -1071,24 +1422,34 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         appearance.performAsCurrentDrawingAppearance {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            processListLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
             processListLayer.isHidden = !showingSetup
+            processChromeLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+            processScrollbarLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
 
             guard showingSetup else {
+                processViewportLayer.isHidden = true
+                processSearchLayer.removeFromSuperlayer()
                 CATransaction.commit()
+                updateTextInputState()
                 return
             }
+
+            processViewportLayer.isHidden = false
 
             let header = makeTextLayer(size: 18, weight: .semibold)
             header.string = "Next Recording"
             header.frame = CGRect(x: 24, y: processListLayer.bounds.height - 42, width: max(processListLayer.bounds.width - 48, 1), height: 24)
-            processListLayer.addSublayer(header)
+            processChromeLayer.addSublayer(header)
 
             let subhead = makeTextLayer(size: 13, weight: .regular)
             subhead.string = "Choose a process, then press Record."
             subhead.foregroundColor = NSColor.secondaryLabelColor.cgColor
             subhead.frame = CGRect(x: 24, y: processListLayer.bounds.height - 66, width: max(processListLayer.bounds.width - 48, 1), height: 18)
-            processListLayer.addSublayer(subhead)
+            processChromeLayer.addSublayer(subhead)
+
+            processSearchLayer.frame = processSearchFrame()
+            processSearchLayer.cornerRadius = 7
+            processChromeLayer.addSublayer(processSearchLayer)
 
             let listFrame = processTableFrame()
             let listBackground = CALayer()
@@ -1097,45 +1458,539 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             listBackground.borderWidth = 1
             listBackground.borderColor = NSColor.separatorColor.cgColor
             listBackground.backgroundColor = tableBackgroundColor.cgColor
-            processListLayer.addSublayer(listBackground)
+            processChromeLayer.addSublayer(listBackground)
 
-            let visibleStart = max(Int(floor(processScroll / rowHeight)), 0)
-            let visibleCount = Int(ceil(listFrame.height / rowHeight)) + 2
-            let visibleEnd = min(processes.count, visibleStart + visibleCount)
-
-            for index in visibleStart..<visibleEnd {
-                let process = processes[index]
-                let y = listFrame.maxY - CGFloat(index - visibleStart + 1) * rowHeight
-                let row = CALayer()
-                row.frame = CGRect(x: listFrame.minX, y: y, width: listFrame.width, height: rowHeight)
-                if process.pid == selectedPID {
-                    row.backgroundColor = NSColor.selectedContentBackgroundColor.withAlphaComponent(0.28).cgColor
-                } else if index % 2 == 1 {
-                    row.backgroundColor = NSColor.labelColor.withAlphaComponent(0.035).cgColor
-                }
-
-                let pidLayer = makeTextLayer(size: 12, weight: .regular, alignment: .right)
-                pidLayer.string = "\(process.pid)"
-                pidLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
-                pidLayer.frame = CGRect(x: 12, y: 7, width: 58, height: 16)
-                row.addSublayer(pidLayer)
-
-                let nameLayer = makeTextLayer(size: 13, weight: .medium)
-                nameLayer.string = process.name
-                nameLayer.frame = CGRect(x: 84, y: 7, width: max(row.bounds.width - 98, 1), height: 16)
-                row.addSublayer(nameLayer)
-
-                processListLayer.addSublayer(row)
-            }
+            processViewportLayer.frame = listFrame.insetBy(dx: 1, dy: 1)
+            rebuildProcessContent()
+            updateProcessSearchDisplay()
+            updateProcessScrollPosition()
             CATransaction.commit()
         }
+        updateTextInputState()
+    }
+
+    private func processSearchFrame() -> CGRect {
+        CGRect(x: 24,
+               y: processListLayer.bounds.height - 116,
+               width: max(processListLayer.bounds.width - 48, 1),
+               height: 34)
     }
 
     private func processTableFrame() -> CGRect {
         CGRect(x: 18,
                y: 18,
                width: max(processListLayer.bounds.width - 36, 1),
-               height: max(processListLayer.bounds.height - 90, 1))
+               height: max(processListLayer.bounds.height - 148, 1))
+    }
+
+    private func filteredProcessIndexList() -> [Int] {
+        let query = processSearchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return Array(processes.indices) }
+        return processes.indices.filter { index in
+            let process = processes[index]
+            return process.name.lowercased().contains(query) ||
+                process.command.lowercased().contains(query) ||
+                String(process.pid).contains(query)
+        }
+    }
+
+    private func rebuildProcessContent() {
+        filteredProcessIndices = filteredProcessIndexList()
+        clampProcessScroll()
+        processContentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        let viewport = processViewportLayer.bounds
+        let contentHeight = max(CGFloat(filteredProcessIndices.count) * rowHeight, viewport.height)
+        processContentLayer.bounds = CGRect(x: 0, y: 0, width: viewport.width, height: contentHeight)
+
+        if filteredProcessIndices.isEmpty {
+            let empty = makeTextLayer(size: 13, weight: .regular)
+            empty.string = processSearchText.isEmpty ? "No processes." : "No matching processes."
+            empty.foregroundColor = NSColor.secondaryLabelColor.cgColor
+            empty.frame = CGRect(x: 14, y: max(contentHeight - 38, 8), width: max(viewport.width - 28, 1), height: 18)
+            processContentLayer.addSublayer(empty)
+            return
+        }
+
+        for displayIndex in filteredProcessIndices.indices {
+            let process = processes[filteredProcessIndices[displayIndex]]
+            let y = contentHeight - CGFloat(displayIndex + 1) * rowHeight
+            let row = CALayer()
+            row.frame = CGRect(x: 0, y: y, width: viewport.width, height: rowHeight)
+            if process.pid == selectedPID {
+                row.backgroundColor = NSColor.selectedContentBackgroundColor.withAlphaComponent(0.28).cgColor
+            } else if displayIndex % 2 == 1 {
+                row.backgroundColor = NSColor.labelColor.withAlphaComponent(0.035).cgColor
+            }
+
+            let pidLayer = makeTextLayer(size: 12, weight: .regular, alignment: .right)
+            pidLayer.string = "\(process.pid)"
+            pidLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
+            pidLayer.frame = CGRect(x: 12, y: 7, width: 58, height: 16)
+            row.addSublayer(pidLayer)
+
+            let nameLayer = makeTextLayer(size: 13, weight: .medium)
+            nameLayer.string = process.name
+            nameLayer.frame = CGRect(x: 84, y: 7, width: max(row.bounds.width - 98, 1), height: 16)
+            row.addSublayer(nameLayer)
+
+            processContentLayer.addSublayer(row)
+        }
+    }
+
+    private func updateProcessScrollPosition() {
+        guard processViewportLayer.superlayer != nil else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let viewport = processViewportLayer.bounds
+        let contentHeight = max(processContentLayer.bounds.height, viewport.height)
+        processContentLayer.frame = CGRect(x: 0,
+                                           y: viewport.height - contentHeight + processScroll,
+                                           width: viewport.width,
+                                           height: contentHeight)
+        addProcessScrollbar()
+        CATransaction.commit()
+    }
+
+    private func addProcessScrollbar() {
+        processScrollbarLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        guard showingSetup else { return }
+        let viewportFrame = processViewportLayer.frame
+        let contentHeight = CGFloat(filteredProcessIndices.count) * rowHeight
+        guard contentHeight > viewportFrame.height + 1 else { return }
+
+        let thickness: CGFloat = 9
+        let inset: CGFloat = 5
+        let trackFrame = CGRect(x: min(viewportFrame.maxX + inset, processListLayer.bounds.maxX - inset - thickness),
+                                y: viewportFrame.minY,
+                                width: thickness,
+                                height: viewportFrame.height)
+        let track = CALayer()
+        track.frame = trackFrame
+        track.cornerRadius = thickness * 0.5
+        track.backgroundColor = scrollbarTrackColor.cgColor
+        processScrollbarLayer.addSublayer(track)
+
+        let proportion = min(max(viewportFrame.height / max(contentHeight, 1), 0), 1)
+        let thumbHeight = min(max(trackFrame.height * proportion, 24), trackFrame.height)
+        let range = max(trackFrame.height - thumbHeight, 0)
+        let progress = processScroll / max(contentHeight - viewportFrame.height, 1)
+        let thumb = CALayer()
+        thumb.frame = CGRect(x: trackFrame.minX,
+                             y: trackFrame.maxY - thumbHeight - range * progress,
+                             width: thickness,
+                             height: thumbHeight)
+        thumb.cornerRadius = thickness * 0.5
+        thumb.backgroundColor = scrollbarThumbColor.cgColor
+        processScrollbarLayer.addSublayer(thumb)
+    }
+
+    private func updateProcessSearchDisplay() {
+        let bounds = processSearchLayer.bounds
+        processSearchLayer.sublayers?.first?.frame = CGRect(x: 10, y: 8, width: 16, height: 16)
+        let textFrame = processSearchTextFrame()
+        processSearchPlaceholderLayer.frame = textFrame
+        processSearchTextLayer.frame = textFrame
+        processSearchTextLayer.string = processSearchText
+        processSearchTextLayer.isHidden = processSearchText.isEmpty
+        processSearchPlaceholderLayer.isHidden = !processSearchText.isEmpty
+        updateProcessSearchSelectionLayer()
+        let corner = min(bounds.height * 0.5, 7)
+        processSearchLayer.cornerRadius = corner
+
+        guard processSearchFocused, processSearchSelectionRange() == nil else {
+            processSearchCursorLayer.isHidden = true
+            processSearchCursorLayer.removeAnimation(forKey: processSearchCaretBlinkAnimationKey)
+            return
+        }
+
+        let caretRect = processSearchCaretRect()
+        processSearchCursorLayer.frame = caretRect
+        processSearchCursorLayer.isHidden = false
+        processSearchCursorLayer.opacity = 1
+        if processSearchCursorLayer.animation(forKey: processSearchCaretBlinkAnimationKey) == nil {
+            let animation = CABasicAnimation(keyPath: "opacity")
+            animation.fromValue = 1
+            animation.toValue = 0
+            animation.duration = 0.55
+            animation.beginTime = CACurrentMediaTime() + 0.55
+            animation.autoreverses = true
+            animation.repeatCount = .infinity
+            animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            processSearchCursorLayer.add(animation, forKey: processSearchCaretBlinkAnimationKey)
+        }
+    }
+
+    private func updateProcessSearchSelectionLayer() {
+        guard processSearchFocused,
+              let range = processSearchSelectionRange(),
+              range.lowerBound < range.upperBound else {
+            processSearchSelectionLayer.isHidden = true
+            return
+        }
+
+        let textFrame = processSearchTextFrame()
+        let line = makeProcessSearchLine()
+        let lower = offsetForProcessSearchCharacter(line: line, index: range.lowerBound, maxWidth: textFrame.width)
+        let upper = offsetForProcessSearchCharacter(line: line, index: range.upperBound, maxWidth: textFrame.width)
+        processSearchSelectionLayer.frame = CGRect(x: textFrame.minX + min(lower, upper),
+                                                   y: textFrame.minY - 1,
+                                                   width: max(abs(upper - lower), 1),
+                                                   height: textFrame.height + 2)
+        processSearchSelectionLayer.cornerRadius = 2
+        processSearchSelectionLayer.isHidden = false
+    }
+
+    private func processSearchTextFrame() -> CGRect {
+        CGRect(x: 32,
+               y: 8,
+               width: max(processSearchLayer.bounds.width - 42, 1),
+               height: 17)
+    }
+
+    private func processSearchCaretRect() -> CGRect {
+        let textFrame = processSearchTextFrame()
+        let contentsScale = max(processSearchTextLayer.contentsScale, 1)
+        let caretWidth = max(CGFloat(1), 1 / contentsScale)
+        let offset: CGFloat
+        if processSearchText.isEmpty {
+            offset = 0
+        } else {
+            let line = makeProcessSearchLine()
+            offset = offsetForProcessSearchCharacter(line: line,
+                                                     index: processSearchCursorPosition,
+                                                     maxWidth: textFrame.width)
+        }
+        return CGRect(x: min(max(textFrame.minX + offset, textFrame.minX), textFrame.maxX - caretWidth),
+                      y: textFrame.minY,
+                      width: caretWidth,
+                      height: textFrame.height)
+    }
+
+    private func makeProcessSearchLine() -> CTLine {
+        let attributed = NSAttributedString(string: processSearchText,
+                                            attributes: [.font: NSFont.systemFont(ofSize: 13, weight: .regular)])
+        return CTLineCreateWithAttributedString(attributed)
+    }
+
+    private func offsetForProcessSearchCharacter(line: CTLine, index: Int, maxWidth: CGFloat) -> CGFloat {
+        let utf16Index = utf16Offset(forCharacterIndex: index, in: processSearchText)
+        var secondaryOffset: CGFloat = 0
+        let primary = CTLineGetOffsetForStringIndex(line, utf16Index, &secondaryOffset)
+        let offset = max(primary, secondaryOffset)
+        return offset.isFinite ? min(max(offset, 0), maxWidth) : 0
+    }
+
+    private func processSearchCursorPosition(at point: CGPoint) -> Int {
+        let textFrame = processSearchLayer.convert(processSearchTextFrame(), to: processListLayer)
+        let localX = max(0, min(point.x - textFrame.minX, textFrame.width))
+        guard !processSearchText.isEmpty else { return 0 }
+        let line = makeProcessSearchLine()
+        let utf16Index = CTLineGetStringIndexForPosition(line, CGPoint(x: localX, y: 0))
+        guard utf16Index != kCFNotFound else { return processSearchText.count }
+        return characterIndex(forUTF16: utf16Index, in: processSearchText)
+    }
+
+    private func focusProcessSearch(cursorPosition: Int, modifySelection: Bool) {
+        processSearchFocused = true
+        moveProcessSearchCursor(to: cursorPosition, modifySelection: modifySelection)
+        updateProcessSearchDisplay()
+        updateColors()
+        updateTextInputState()
+    }
+
+    private func blurProcessSearch() {
+        guard processSearchFocused else { return }
+        processSearchFocused = false
+        processSearchSelectionAnchor = nil
+        updateProcessSearchDisplay()
+        updateColors()
+        updateTextInputState()
+    }
+
+    private func setProcessSearchText(_ text: String) {
+        processSearchText = text
+        processSearchCursorPosition = min(processSearchCursorPosition, processSearchText.count)
+        processSearchSelectionAnchor = nil
+        processScroll = 0
+        rebuildProcessContent()
+        updateProcessSearchDisplay()
+        updateProcessScrollPosition()
+        updateTextInputState()
+    }
+
+    private func insertProcessSearchText(_ text: String, replacementRange: Range<Int>?) {
+        let range = replacementRange ?? processSearchSelectionRange() ?? processSearchCursorPosition..<processSearchCursorPosition
+        replaceProcessSearchText(range: range, with: text)
+    }
+
+    private func replaceProcessSearchText(range: Range<Int>, with replacement: String) {
+        let lower = min(max(range.lowerBound, 0), processSearchText.count)
+        let upper = min(max(range.upperBound, lower), processSearchText.count)
+        let start = processSearchText.index(processSearchText.startIndex, offsetBy: lower)
+        let end = processSearchText.index(processSearchText.startIndex, offsetBy: upper)
+        processSearchText.replaceSubrange(start..<end, with: replacement)
+        processSearchCursorPosition = lower + replacement.count
+        processSearchSelectionAnchor = nil
+        setProcessSearchText(processSearchText)
+    }
+
+    private func deleteProcessSearchBackward() {
+        if deleteProcessSearchSelection() {
+            return
+        }
+        guard processSearchCursorPosition > 0 else { return }
+        replaceProcessSearchText(range: (processSearchCursorPosition - 1)..<processSearchCursorPosition, with: "")
+    }
+
+    private func deleteProcessSearchForward() {
+        if deleteProcessSearchSelection() {
+            return
+        }
+        guard processSearchCursorPosition < processSearchText.count else { return }
+        replaceProcessSearchText(range: processSearchCursorPosition..<(processSearchCursorPosition + 1), with: "")
+    }
+
+    @discardableResult
+    private func deleteProcessSearchSelection() -> Bool {
+        guard let range = processSearchSelectionRange() else { return false }
+        replaceProcessSearchText(range: range, with: "")
+        return true
+    }
+
+    private func deleteProcessSearchWordBackward() {
+        if deleteProcessSearchSelection() {
+            return
+        }
+        let boundary = previousProcessSearchWordBoundary(from: processSearchCursorPosition)
+        replaceProcessSearchText(range: boundary..<processSearchCursorPosition, with: "")
+    }
+
+    private func deleteProcessSearchWordForward() {
+        if deleteProcessSearchSelection() {
+            return
+        }
+        let boundary = nextProcessSearchWordBoundary(from: processSearchCursorPosition)
+        replaceProcessSearchText(range: processSearchCursorPosition..<boundary, with: "")
+    }
+
+    private func moveProcessSearchCursor(to position: Int,
+                                         modifySelection: Bool,
+                                         collapsingSelectionTowardStart: Bool? = nil) {
+        let clamped = min(max(position, 0), processSearchText.count)
+        if modifySelection {
+            if processSearchSelectionAnchor == nil {
+                processSearchSelectionAnchor = processSearchCursorPosition
+            }
+            processSearchCursorPosition = clamped
+        } else if let range = processSearchSelectionRange(), let collapseToStart = collapsingSelectionTowardStart {
+            processSearchCursorPosition = collapseToStart ? range.lowerBound : range.upperBound
+            processSearchSelectionAnchor = nil
+        } else {
+            processSearchCursorPosition = clamped
+            processSearchSelectionAnchor = nil
+        }
+        updateProcessSearchDisplay()
+        updateTextInputState()
+    }
+
+    private func selectAllProcessSearchText() {
+        guard processSearchFocused else { return }
+        processSearchSelectionAnchor = 0
+        processSearchCursorPosition = processSearchText.count
+        updateProcessSearchDisplay()
+        updateTextInputState()
+    }
+
+    private func processSearchSelectionRange() -> Range<Int>? {
+        guard let anchor = processSearchSelectionAnchor, anchor != processSearchCursorPosition else { return nil }
+        let lower = min(anchor, processSearchCursorPosition)
+        let upper = max(anchor, processSearchCursorPosition)
+        return lower..<upper
+    }
+
+    private func selectedProcessSearchText() -> String? {
+        guard let range = processSearchSelectionRange() else { return nil }
+        let start = processSearchText.index(processSearchText.startIndex, offsetBy: range.lowerBound)
+        let end = processSearchText.index(processSearchText.startIndex, offsetBy: range.upperBound)
+        return String(processSearchText[start..<end])
+    }
+
+    private func previousProcessSearchWordBoundary(from position: Int) -> Int {
+        guard !processSearchText.isEmpty else { return 0 }
+        let clamped = min(max(position, 0), processSearchText.count)
+        guard clamped > 0 else { return 0 }
+
+        let tokenizer = CFStringTokenizerCreate(kCFAllocatorDefault,
+                                                processSearchText as CFString,
+                                                CFRangeMake(0, processSearchText.utf16.count),
+                                                kCFStringTokenizerUnitWordBoundary,
+                                                nil)
+        var previous = 0
+        var tokenType = CFStringTokenizerAdvanceToNextToken(tokenizer)
+        while tokenType.rawValue != 0 {
+            let range = CFStringTokenizerGetCurrentTokenRange(tokenizer)
+            let end = characterIndex(forUTF16: range.location + range.length, in: processSearchText)
+            if end >= clamped {
+                break
+            }
+            previous = end
+            tokenType = CFStringTokenizerAdvanceToNextToken(tokenizer)
+        }
+        return previous
+    }
+
+    private func nextProcessSearchWordBoundary(from position: Int) -> Int {
+        guard !processSearchText.isEmpty else { return 0 }
+        let clamped = min(max(position, 0), processSearchText.count)
+        guard clamped < processSearchText.count else { return processSearchText.count }
+
+        let tokenizer = CFStringTokenizerCreate(kCFAllocatorDefault,
+                                                processSearchText as CFString,
+                                                CFRangeMake(0, processSearchText.utf16.count),
+                                                kCFStringTokenizerUnitWordBoundary,
+                                                nil)
+        var tokenType = CFStringTokenizerAdvanceToNextToken(tokenizer)
+        while tokenType.rawValue != 0 {
+            let range = CFStringTokenizerGetCurrentTokenRange(tokenizer)
+            let end = characterIndex(forUTF16: range.location + range.length, in: processSearchText)
+            if end > clamped {
+                return end
+            }
+            tokenType = CFStringTokenizerAdvanceToNextToken(tokenizer)
+        }
+        return processSearchText.count
+    }
+
+    private func showProcessSearchContextMenu(at point: CGPoint) {
+        let menuID = UUID()
+        processSearchContextMenuIDs.insert(menuID)
+        let hasSelection = processSearchSelectionRange() != nil
+        let items = [
+            OuterframeContextMenuItem(id: "cut",
+                                      title: "Cut",
+                                      isEnabled: hasSelection,
+                                      keyEquivalent: "x",
+                                      keyEquivalentModifierMask: UInt32(truncatingIfNeeded: NSEvent.ModifierFlags.command.rawValue)),
+            OuterframeContextMenuItem(id: "copy",
+                                      title: "Copy",
+                                      isEnabled: hasSelection,
+                                      keyEquivalent: "c",
+                                      keyEquivalentModifierMask: UInt32(truncatingIfNeeded: NSEvent.ModifierFlags.command.rawValue)),
+            OuterframeContextMenuItem(id: "paste",
+                                      title: "Paste",
+                                      keyEquivalent: "v",
+                                      keyEquivalentModifierMask: UInt32(truncatingIfNeeded: NSEvent.ModifierFlags.command.rawValue)),
+            OuterframeContextMenuItem(id: "separator", title: "", kind: .separator),
+            OuterframeContextMenuItem(id: "selectAll",
+                                      title: "Select All",
+                                      isEnabled: !processSearchText.isEmpty,
+                                      keyEquivalent: "a",
+                                      keyEquivalentModifierMask: UInt32(truncatingIfNeeded: NSEvent.ModifierFlags.command.rawValue))
+        ]
+        outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
+    }
+
+    private func handleProcessSearchContextMenuSelection(itemID: String) {
+        switch itemID {
+        case "cut":
+            writeProcessSearchSelectionToPasteboard(cut: true)
+        case "copy":
+            writeProcessSearchSelectionToPasteboard(cut: false)
+        case "paste":
+            readPasteboardIntoProcessSearch()
+        case "selectAll":
+            selectAllProcessSearchText()
+        default:
+            break
+        }
+    }
+
+    private func processSearchPasteboardItems() -> [OuterContentPasteboardItem] {
+        guard let text = selectedProcessSearchText(),
+              let data = text.data(using: .utf8) else { return [] }
+        return [OuterContentPasteboardItem(representations: [
+            OuterContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.string.rawValue,
+                                                 data: data)
+        ])]
+    }
+
+    private func writeProcessSearchSelectionToPasteboard(cut: Bool) {
+        let items = processSearchPasteboardItems()
+        guard !items.isEmpty else { return }
+        outerframeHost.requestPasteboardWrite(items: items) { [weak self] granted in
+            guard granted, cut else { return }
+            self?.deleteProcessSearchSelection()
+        }
+    }
+
+    private func readPasteboardIntoProcessSearch() {
+        outerframeHost.requestPasteboardRead(typeIdentifiers: processSearchPasteboardTypeIdentifiers) { [weak self] granted, items in
+            guard granted else { return }
+            self?.insertProcessSearchPasteboardItems(items)
+        }
+    }
+
+    private func insertProcessSearchPasteboardItems(_ items: [OuterContentPasteboardItem]) {
+        guard processSearchFocused else { return }
+        for item in items {
+            for representation in item.representations {
+                if representation.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue,
+                   let string = String(data: representation.data, encoding: .utf8) {
+                    insertProcessSearchText(string, replacementRange: nil)
+                    return
+                }
+                if representation.typeIdentifier == NSPasteboard.PasteboardType.rtf.rawValue,
+                   let attributed = NSAttributedString(rtf: representation.data, documentAttributes: nil) {
+                    insertProcessSearchText(attributed.string, replacementRange: nil)
+                    return
+                }
+            }
+        }
+    }
+
+    private func updateTextInputState() {
+        let inputMode: OuterframeContentInputMode = processSearchFocused ? [.textInput, .rawKeys] : .rawKeys
+        outerframeHost.setInputMode(inputMode)
+        let hasSelection = processSearchSelectionRange() != nil
+        outerframeHost.setEditingCapabilities(canCopy: processSearchFocused && hasSelection,
+                                              canCut: processSearchFocused && hasSelection)
+        outerframeHost.setAcceptedPasteboardPasteTypes(processSearchFocused ? processSearchPasteboardTypeIdentifiers : [])
+        guard processSearchFocused, showingSetup else {
+            outerframeHost.sendTextInputGeometryUpdate(nil)
+            return
+        }
+        guard !hasSelection else {
+            outerframeHost.sendTextInputGeometryUpdate(nil)
+            return
+        }
+        let caretFrame = processSearchCaretRect()
+        let rootCaretFrame = processSearchLayer.convert(caretFrame, to: rootLayer)
+        let topLeftY = rootLayer.bounds.height - rootCaretFrame.origin.y - rootCaretFrame.height
+        let geometry = OuterframeContentTextInputGeometry(fieldID: Self.processSearchFieldID,
+                                                          rect: CGRect(x: rootCaretFrame.origin.x,
+                                                                       y: topLeftY,
+                                                                       width: rootCaretFrame.width,
+                                                                       height: rootCaretFrame.height))
+        outerframeHost.sendTextInputGeometryUpdate(geometry)
+    }
+
+    private var processSearchPasteboardTypeIdentifiers: [String] {
+        [
+            NSPasteboard.PasteboardType.string.rawValue,
+            NSPasteboard.PasteboardType.rtf.rawValue
+        ]
+    }
+
+    private func utf16Offset(forCharacterIndex index: Int, in text: String) -> Int {
+        let clamped = max(0, min(index, text.count))
+        let stringIndex = text.index(text.startIndex, offsetBy: clamped)
+        return text[text.startIndex..<stringIndex].utf16.count
+    }
+
+    private func characterIndex(forUTF16 offset: Int, in text: String) -> Int {
+        let clamped = max(0, min(offset, text.utf16.count))
+        let stringIndex = String.Index(utf16Offset: clamped, in: text)
+        return text.distance(from: text.startIndex, to: stringIndex)
     }
 
     private func updateTimeline() {
@@ -1162,6 +2017,16 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             track.frame = chartRect
             track.backgroundColor = timelineTrackColor.cgColor
             timelineLayer.addSublayer(track)
+
+            if isRecording, lastProfile == nil {
+                let empty = makeTextLayer(size: 13, weight: .regular)
+                empty.string = "Recording in progress..."
+                empty.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                empty.frame = CGRect(x: chartRect.minX + 10, y: chartRect.midY - 8, width: max(chartRect.width - 20, 1), height: 16)
+                timelineLayer.addSublayer(empty)
+                CATransaction.commit()
+                return
+            }
 
             guard let profile = lastProfile, !profile.timeline.isEmpty else {
                 let empty = makeTextLayer(size: 13, weight: .regular)
@@ -1253,11 +2118,15 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             }
 
             guard let profile = lastProfile else {
-                let empty = makeTextLayer(size: 14, weight: .regular)
-                empty.string = "Select a trace to see sampled call stacks."
-                empty.foregroundColor = NSColor.secondaryLabelColor.cgColor
-                empty.frame = CGRect(x: 22, y: flameLayer.bounds.height - 42, width: max(flameLayer.bounds.width - 44, 1), height: 18)
-                flameDecorationLayer.addSublayer(empty)
+                if isRecording {
+                    addRecordingPlaceholder()
+                } else {
+                    let empty = makeTextLayer(size: 14, weight: .regular)
+                    empty.string = "Select a trace to see sampled call stacks."
+                    empty.foregroundColor = NSColor.secondaryLabelColor.cgColor
+                    empty.frame = CGRect(x: 22, y: flameLayer.bounds.height - 42, width: max(flameLayer.bounds.width - 44, 1), height: 18)
+                    flameDecorationLayer.addSublayer(empty)
+                }
                 flameContentSize = .zero
                 CATransaction.commit()
                 return
@@ -1322,6 +2191,32 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     }
 
     private var flameGraphRowHeight: CGFloat { 31 }
+
+    private func addRecordingPlaceholder() {
+        let symbol = makeSymbolLayer("record.circle", color: NSColor.systemRed)
+        symbol.frame = CGRect(x: 22, y: flameLayer.bounds.height - 70, width: 28, height: 28)
+        flameDecorationLayer.addSublayer(symbol)
+
+        let title = makeTextLayer(size: 18, weight: .semibold)
+        title.string = "Recording"
+        title.frame = CGRect(x: 58, y: flameLayer.bounds.height - 62, width: max(flameLayer.bounds.width - 80, 1), height: 24)
+        flameDecorationLayer.addSublayer(title)
+
+        let target = activeRecordingPID.map { "pid \($0)" } ?? selectedProcessSubtitle
+        let frequency = activeRecordingFrequency.map { " at \($0) Hz" } ?? ""
+        let elapsed: String
+        if let recordingStartedAt {
+            elapsed = "  \(formatDuration(Date().timeIntervalSince(recordingStartedAt))) elapsed"
+        } else {
+            elapsed = ""
+        }
+
+        let subtitle = makeTextLayer(size: 13, weight: .regular)
+        subtitle.string = "\(target)\(frequency). Press Stop to build the profile.\(elapsed)"
+        subtitle.foregroundColor = NSColor.secondaryLabelColor.cgColor
+        subtitle.frame = CGRect(x: 58, y: flameLayer.bounds.height - 86, width: max(flameLayer.bounds.width - 80, 1), height: 18)
+        flameDecorationLayer.addSublayer(subtitle)
+    }
 
     private func flameGraphViewportRect() -> CGRect {
         CGRect(x: 18,
@@ -1680,6 +2575,10 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         isDarkMode ? NSColor.controlBackgroundColor.withAlphaComponent(0.62) : NSColor.textBackgroundColor
     }
 
+    private var searchFieldBackgroundColor: NSColor {
+        isDarkMode ? NSColor.textBackgroundColor.withAlphaComponent(0.44) : NSColor.textBackgroundColor
+    }
+
     private var timelineTrackColor: NSColor {
         isDarkMode ? NSColor.controlBackgroundColor.withAlphaComponent(0.78) : NSColor.controlBackgroundColor
     }
@@ -1701,7 +2600,9 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func clampProcessScroll() {
-        let maxOffset = max(CGFloat(processes.count) * rowHeight - max(processListLayer.bounds.height - 90, 1), 0)
+        let viewportHeight = max(processViewportLayer.bounds.height, processTableFrame().insetBy(dx: 1, dy: 1).height, 1)
+        let count = filteredProcessIndices.isEmpty && !processes.isEmpty && processSearchText.isEmpty ? processes.count : filteredProcessIndices.count
+        let maxOffset = max(CGFloat(count) * rowHeight - viewportHeight, 0)
         processScroll = min(max(processScroll, 0), maxOffset)
     }
 
