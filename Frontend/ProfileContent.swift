@@ -353,6 +353,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     private let processListLayer = CALayer()
     private let processChromeLayer = CALayer()
     private let processSearchLayer = CALayer()
+    private let processSearchIconLayer = CALayer()
     private let processSearchTextLayer = CATextLayer()
     private let processSearchPlaceholderLayer = CATextLayer()
     private let processSearchSelectionLayer = CALayer()
@@ -360,6 +361,9 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     private let processViewportLayer = CALayer()
     private let processContentLayer = CALayer()
     private let processScrollbarLayer = CALayer()
+    private let traceViewportLayer = CALayer()
+    private let traceContentLayer = CALayer()
+    private let traceScrollbarLayer = CALayer()
     private let timelineLayer = CALayer()
     private let flameLayer = CALayer()
     private let flameDecorationLayer = CALayer()
@@ -389,6 +393,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     private var selectedTraceID: UInt64?
     private var selectedPID: Int?
     private var processScroll: CGFloat = 0
+    private var traceScroll: CGFloat = 0
     private var processSearchText = ""
     private var processSearchCursorPosition = 0
     private var processSearchSelectionAnchor: Int?
@@ -455,6 +460,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         case .resizeContent(let size):
             currentSize = size
             clampProcessScroll()
+            clampTraceScroll()
             updateLayout()
 
         case .systemAppearanceUpdate(let appearance):
@@ -467,6 +473,13 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
                 processScroll -= delta.y * multiplier
                 clampProcessScroll()
                 updateProcessScrollPosition()
+            } else if sidebarLayer.frame.contains(point) {
+                let sidebarPoint = sidebarLayer.convert(point, from: rootLayer)
+                if traceViewportLayer.frame.contains(sidebarPoint) {
+                    traceScroll -= delta.y * multiplier
+                    clampTraceScroll()
+                    updateTraceScrollPosition()
+                }
             } else if !showingSetup, flameLayer.frame.contains(point) {
                 flameHorizontalScroll -= delta.x * multiplier
                 flameVerticalScroll -= delta.y * multiplier
@@ -584,6 +597,8 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         processListLayer.addSublayer(processScrollbarLayer)
         processViewportLayer.masksToBounds = true
         processViewportLayer.addSublayer(processContentLayer)
+        traceViewportLayer.masksToBounds = true
+        traceViewportLayer.addSublayer(traceContentLayer)
 
         flameLayer.addSublayer(flameDecorationLayer)
         flameLayer.addSublayer(flameViewportLayer)
@@ -597,7 +612,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         toolbarLayer.addSublayer(refreshButtonLayer)
         refreshButtonLayer.addSublayer(makeButtonLabel("Refresh"))
 
-        processSearchLayer.addSublayer(makeSymbolLayer("magnifyingglass", color: .secondaryLabelColor))
+        processSearchLayer.addSublayer(processSearchIconLayer)
         processSearchLayer.addSublayer(processSearchSelectionLayer)
         processSearchLayer.addSublayer(processSearchPlaceholderLayer)
         processSearchLayer.addSublayer(processSearchTextLayer)
@@ -654,6 +669,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             processSearchTextLayer.foregroundColor = NSColor.labelColor.cgColor
             processSearchSelectionLayer.backgroundColor = NSColor.selectedTextBackgroundColor.withAlphaComponent(isDarkMode ? 0.58 : 0.42).cgColor
             processSearchCursorLayer.backgroundColor = NSColor.labelColor.cgColor
+            updateSymbolLayer(processSearchIconLayer, symbolName: "magnifyingglass", color: NSColor.secondaryLabelColor)
             timelineLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
             flameLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
             statusLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
@@ -813,23 +829,39 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func traceIndex(at point: CGPoint) -> Int? {
-        for index in traces.indices.reversed() {
-            let visualIndex = traces.count - 1 - index
-            if traceFrame(visualIndex: visualIndex).contains(point) {
-                return index
-            }
+        guard traceViewportLayer.frame.contains(point) else { return nil }
+        let viewport = traceViewportLayer.bounds
+        let contentHeight = max(CGFloat(traceRowCount()) * runRowHeight, viewport.height)
+        let contentOffsetY = viewport.height - contentHeight + traceScroll
+        let contentPoint = CGPoint(x: point.x - traceViewportLayer.frame.minX,
+                                   y: point.y - traceViewportLayer.frame.minY - contentOffsetY)
+        let visualIndex = Int(floor((contentHeight - contentPoint.y) / runRowHeight))
+        guard visualIndex >= activeRecordingTraceRowCount(),
+              visualIndex < traceRowCount(),
+              traceFrame(visualIndex: visualIndex).contains(contentPoint) else {
+            return nil
         }
-        return nil
+        let traceVisualIndex = visualIndex - activeRecordingTraceRowCount()
+        let index = traces.count - 1 - traceVisualIndex
+        guard traces.indices.contains(index) else { return nil }
+        return index
     }
 
     private func nextRecordingFrame() -> CGRect {
         CGRect(x: 10, y: sidebarLayer.bounds.height - 118, width: sidebarLayer.bounds.width - 20, height: runRowHeight - 4)
     }
 
+    private func traceViewportFrame() -> CGRect {
+        CGRect(x: 0,
+               y: 0,
+               width: sidebarLayer.bounds.width,
+               height: max(sidebarLayer.bounds.height - 170, 1))
+    }
+
     private func traceFrame(visualIndex: Int) -> CGRect {
-        let runTop = sidebarLayer.bounds.height - 170
-        let y = runTop - CGFloat(visualIndex + 1) * runRowHeight
-        return CGRect(x: 10, y: y, width: sidebarLayer.bounds.width - 20, height: runRowHeight - 8)
+        let contentHeight = max(traceContentLayer.bounds.height, traceViewportLayer.bounds.height)
+        let y = contentHeight - CGFloat(visualIndex + 1) * runRowHeight
+        return CGRect(x: 10, y: y, width: traceViewportLayer.bounds.width - 20, height: runRowHeight - 8)
     }
 
     private func selectTrace(at index: Int) {
@@ -1159,6 +1191,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
                     self.activeRecordingPID = decoded.pid
                     self.activeRecordingFrequency = decoded.frequency
                     self.recordingStartedAt = Date()
+                    self.traceScroll = 0
                     self.showingSetup = false
                     self.selectedTraceID = decoded.recordingID
                     self.lastProfile = nil
@@ -1354,31 +1387,42 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             runs.frame = CGRect(x: 16, y: sidebarLayer.bounds.height - 152, width: sidebarLayer.bounds.width - 32, height: 16)
             sidebarLayer.addSublayer(runs)
 
-            var extraTraceRows = 0
-            if isRecording, let activeRecordingID, !traces.contains(where: { $0.profileID == activeRecordingID }) {
+            traceViewportLayer.frame = traceViewportFrame()
+            traceScrollbarLayer.frame = sidebarLayer.bounds
+            sidebarLayer.addSublayer(traceViewportLayer)
+            sidebarLayer.addSublayer(traceScrollbarLayer)
+            traceContentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+
+            let viewport = traceViewportLayer.bounds
+            let contentHeight = max(CGFloat(traceRowCount()) * runRowHeight, viewport.height)
+            traceContentLayer.bounds = CGRect(x: 0, y: 0, width: viewport.width, height: contentHeight)
+            clampTraceScroll()
+
+            let extraTraceRows = activeRecordingTraceRowCount()
+            if extraTraceRows > 0, let activeRecordingID {
                 let subtitle = activeRecordingPID.map { "pid \($0)  Recording" } ?? "Recording"
-                sidebarLayer.addSublayer(makeSidebarRow(frame: traceFrame(visualIndex: 0),
-                                                        title: "Recording",
-                                                        subtitle: subtitle,
-                                                        iconName: "chart.bar.fill",
-                                                        selected: selectedTraceID == activeRecordingID))
-                extraTraceRows = 1
+                traceContentLayer.addSublayer(makeSidebarRow(frame: traceFrame(visualIndex: 0),
+                                                             title: "Recording",
+                                                             subtitle: subtitle,
+                                                             iconName: "chart.bar.fill",
+                                                             selected: selectedTraceID == activeRecordingID))
             }
 
             for index in traces.indices.reversed() {
                 let visualIndex = traces.count - 1 - index + extraTraceRows
                 let frame = traceFrame(visualIndex: visualIndex)
-                guard frame.maxY > 0 else { continue }
                 let trace = traces[index]
                 let title = "Run \(index + 1)"
                 let subtitle = "pid \(trace.pid)  \(formatDuration(trace.duration))"
-                sidebarLayer.addSublayer(makeSidebarRow(frame: frame,
-                                                        title: title,
-                                                        subtitle: subtitle,
-                                                        iconName: "chart.bar.fill",
-                                                        selected: selectedTraceID == trace.profileID))
+                traceContentLayer.addSublayer(makeSidebarRow(frame: frame,
+                                                             title: title,
+                                                             subtitle: subtitle,
+                                                             iconName: "chart.bar.fill",
+                                                             selected: selectedTraceID == trace.profileID))
             }
 
+            positionTraceContentLayer()
+            addTraceScrollbar()
             CATransaction.commit()
         }
     }
@@ -1391,7 +1435,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         return "pid \(selectedPID)"
     }
 
-    private func makeSidebarRow(frame: CGRect, title: String, subtitle: String, iconName: String, selected: Bool) -> CALayer {
+    private func makeSidebarRow(frame: CGRect, title: String, subtitle: String, iconName: String?, selected: Bool) -> CALayer {
         let row = CALayer()
         row.frame = frame
         row.cornerRadius = 8
@@ -1399,22 +1443,91 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             row.backgroundColor = NSColor.selectedContentBackgroundColor.cgColor
         }
 
-        let icon = makeSymbolLayer(iconName, color: selected ? .white : NSColor.secondaryLabelColor)
-        icon.frame = CGRect(x: 12, y: frame.height - 23, width: 16, height: 16)
-        row.addSublayer(icon)
+        let textX: CGFloat
+        if let iconName {
+            let icon = makeSymbolLayer(iconName, color: selected ? .white : NSColor.secondaryLabelColor)
+            icon.frame = CGRect(x: 12, y: frame.height - 23, width: 16, height: 16)
+            row.addSublayer(icon)
+            textX = 38
+        } else {
+            textX = 16
+        }
 
         let titleLayer = makeTextLayer(size: 13, weight: .semibold)
         titleLayer.string = title
         titleLayer.foregroundColor = selected ? NSColor.white.cgColor : NSColor.labelColor.cgColor
-        titleLayer.frame = CGRect(x: 38, y: frame.height - 23, width: max(frame.width - 50, 1), height: 16)
+        titleLayer.frame = CGRect(x: textX, y: frame.height - 23, width: max(frame.width - textX - 12, 1), height: 16)
         row.addSublayer(titleLayer)
 
         let subtitleLayer = makeTextLayer(size: 12, weight: .regular)
         subtitleLayer.string = subtitle
         subtitleLayer.foregroundColor = selected ? NSColor.white.withAlphaComponent(0.82).cgColor : NSColor.secondaryLabelColor.cgColor
-        subtitleLayer.frame = CGRect(x: 38, y: 7, width: max(frame.width - 50, 1), height: 15)
+        subtitleLayer.frame = CGRect(x: textX, y: 7, width: max(frame.width - textX - 12, 1), height: 15)
         row.addSublayer(subtitleLayer)
         return row
+    }
+
+    private func activeRecordingTraceRowCount() -> Int {
+        guard isRecording,
+              let activeRecordingID,
+              !traces.contains(where: { $0.profileID == activeRecordingID }) else {
+            return 0
+        }
+        return 1
+    }
+
+    private func traceRowCount() -> Int {
+        traces.count + activeRecordingTraceRowCount()
+    }
+
+    private func positionTraceContentLayer() {
+        let viewport = traceViewportLayer.bounds
+        let contentHeight = max(traceContentLayer.bounds.height, viewport.height)
+        traceContentLayer.frame = CGRect(x: 0,
+                                         y: viewport.height - contentHeight + traceScroll,
+                                         width: viewport.width,
+                                         height: contentHeight)
+    }
+
+    private func updateTraceScrollPosition() {
+        guard traceViewportLayer.superlayer != nil else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        positionTraceContentLayer()
+        addTraceScrollbar()
+        CATransaction.commit()
+    }
+
+    private func addTraceScrollbar() {
+        traceScrollbarLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        let viewportFrame = traceViewportLayer.frame
+        let contentHeight = CGFloat(traceRowCount()) * runRowHeight
+        guard contentHeight > viewportFrame.height + 1 else { return }
+
+        let thickness: CGFloat = 9
+        let inset: CGFloat = 5
+        let trackFrame = CGRect(x: max(viewportFrame.maxX - inset - thickness, viewportFrame.minX + inset),
+                                y: viewportFrame.minY + inset,
+                                width: thickness,
+                                height: max(viewportFrame.height - inset * 2, 1))
+        let track = CALayer()
+        track.frame = trackFrame
+        track.cornerRadius = thickness * 0.5
+        track.backgroundColor = resolvedCGColor(scrollbarTrackColor)
+        traceScrollbarLayer.addSublayer(track)
+
+        let proportion = min(max(viewportFrame.height / max(contentHeight, 1), 0), 1)
+        let thumbHeight = min(max(trackFrame.height * proportion, 24), trackFrame.height)
+        let range = max(trackFrame.height - thumbHeight, 0)
+        let progress = traceScroll / max(contentHeight - viewportFrame.height, 1)
+        let thumb = CALayer()
+        thumb.frame = CGRect(x: trackFrame.minX,
+                             y: trackFrame.maxY - thumbHeight - range * progress,
+                             width: thickness,
+                             height: thumbHeight)
+        thumb.cornerRadius = thickness * 0.5
+        thumb.backgroundColor = resolvedCGColor(scrollbarThumbColor)
+        traceScrollbarLayer.addSublayer(thumb)
     }
 
     private func updateProcessRows() {
@@ -1567,7 +1680,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         let track = CALayer()
         track.frame = trackFrame
         track.cornerRadius = thickness * 0.5
-        track.backgroundColor = scrollbarTrackColor.cgColor
+        track.backgroundColor = resolvedCGColor(scrollbarTrackColor)
         processScrollbarLayer.addSublayer(track)
 
         let proportion = min(max(viewportFrame.height / max(contentHeight, 1), 0), 1)
@@ -1580,13 +1693,13 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
                              width: thickness,
                              height: thumbHeight)
         thumb.cornerRadius = thickness * 0.5
-        thumb.backgroundColor = scrollbarThumbColor.cgColor
+        thumb.backgroundColor = resolvedCGColor(scrollbarThumbColor)
         processScrollbarLayer.addSublayer(thumb)
     }
 
     private func updateProcessSearchDisplay() {
         let bounds = processSearchLayer.bounds
-        processSearchLayer.sublayers?.first?.frame = CGRect(x: 10, y: 8, width: 16, height: 16)
+        processSearchIconLayer.frame = CGRect(x: 10, y: 8, width: 16, height: 16)
         let textFrame = processSearchTextFrame()
         processSearchPlaceholderLayer.frame = textFrame
         processSearchTextLayer.frame = textFrame
@@ -2193,13 +2306,9 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     private var flameGraphRowHeight: CGFloat { 31 }
 
     private func addRecordingPlaceholder() {
-        let symbol = makeSymbolLayer("record.circle", color: NSColor.systemRed)
-        symbol.frame = CGRect(x: 22, y: flameLayer.bounds.height - 70, width: 28, height: 28)
-        flameDecorationLayer.addSublayer(symbol)
-
         let title = makeTextLayer(size: 18, weight: .semibold)
         title.string = "Recording"
-        title.frame = CGRect(x: 58, y: flameLayer.bounds.height - 62, width: max(flameLayer.bounds.width - 80, 1), height: 24)
+        title.frame = CGRect(x: 22, y: flameLayer.bounds.height - 62, width: max(flameLayer.bounds.width - 44, 1), height: 24)
         flameDecorationLayer.addSublayer(title)
 
         let target = activeRecordingPID.map { "pid \($0)" } ?? selectedProcessSubtitle
@@ -2214,7 +2323,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         let subtitle = makeTextLayer(size: 13, weight: .regular)
         subtitle.string = "\(target)\(frequency). Press Stop to build the profile.\(elapsed)"
         subtitle.foregroundColor = NSColor.secondaryLabelColor.cgColor
-        subtitle.frame = CGRect(x: 58, y: flameLayer.bounds.height - 86, width: max(flameLayer.bounds.width - 80, 1), height: 18)
+        subtitle.frame = CGRect(x: 22, y: flameLayer.bounds.height - 86, width: max(flameLayer.bounds.width - 44, 1), height: 18)
         flameDecorationLayer.addSublayer(subtitle)
     }
 
@@ -2492,7 +2601,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             let track = CALayer()
             track.frame = trackFrame
             track.cornerRadius = corner
-            track.backgroundColor = scrollbarTrackColor.cgColor
+            track.backgroundColor = resolvedCGColor(scrollbarTrackColor)
             flameScrollbarLayer.addSublayer(track)
 
             let proportion = min(max(viewport.height / max(flameContentSize.height, 1), 0), 1)
@@ -2505,7 +2614,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
                                  width: thickness,
                                  height: thumbHeight)
             thumb.cornerRadius = corner
-            thumb.backgroundColor = scrollbarThumbColor.cgColor
+            thumb.backgroundColor = resolvedCGColor(scrollbarThumbColor)
             flameScrollbarLayer.addSublayer(thumb)
         }
 
@@ -2518,7 +2627,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             let track = CALayer()
             track.frame = trackFrame
             track.cornerRadius = corner
-            track.backgroundColor = scrollbarTrackColor.cgColor
+            track.backgroundColor = resolvedCGColor(scrollbarTrackColor)
             flameScrollbarLayer.addSublayer(track)
 
             let proportion = min(max(viewport.width / max(flameContentSize.width, 1), 0), 1)
@@ -2531,7 +2640,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
                                  width: thumbWidth,
                                  height: thickness)
             thumb.cornerRadius = corner
-            thumb.backgroundColor = scrollbarThumbColor.cgColor
+            thumb.backgroundColor = resolvedCGColor(scrollbarThumbColor)
             flameScrollbarLayer.addSublayer(thumb)
         }
     }
@@ -2592,11 +2701,23 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     }
 
     private var scrollbarTrackColor: NSColor {
-        isDarkMode ? NSColor.unemphasizedSelectedTextBackgroundColor.withAlphaComponent(0.6) : NSColor.unemphasizedSelectedTextBackgroundColor.withAlphaComponent(0.35)
+        isDarkMode
+            ? NSColor(calibratedWhite: 1.0, alpha: 0.10)
+            : NSColor(calibratedWhite: 0.0, alpha: 0.08)
     }
 
     private var scrollbarThumbColor: NSColor {
-        isDarkMode ? NSColor.secondaryLabelColor.withAlphaComponent(0.85) : NSColor.secondaryLabelColor.withAlphaComponent(0.75)
+        isDarkMode
+            ? NSColor(calibratedWhite: 1.0, alpha: 0.42)
+            : NSColor(calibratedWhite: 0.0, alpha: 0.34)
+    }
+
+    private func resolvedCGColor(_ color: NSColor) -> CGColor {
+        var cgColor = color.cgColor
+        appearance.performAsCurrentDrawingAppearance {
+            cgColor = color.cgColor
+        }
+        return cgColor
     }
 
     private func clampProcessScroll() {
@@ -2604,6 +2725,12 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         let count = filteredProcessIndices.isEmpty && !processes.isEmpty && processSearchText.isEmpty ? processes.count : filteredProcessIndices.count
         let maxOffset = max(CGFloat(count) * rowHeight - viewportHeight, 0)
         processScroll = min(max(processScroll, 0), maxOffset)
+    }
+
+    private func clampTraceScroll() {
+        let viewportHeight = max(traceViewportLayer.bounds.height, traceViewportFrame().height, 1)
+        let maxOffset = max(CGFloat(traceRowCount()) * runRowHeight - viewportHeight, 0)
+        traceScroll = min(max(traceScroll, 0), maxOffset)
     }
 
     private func resetFlameViewport() {
@@ -2661,22 +2788,31 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
 
     private func makeSymbolLayer(_ symbolName: String, color: NSColor) -> CALayer {
         let layer = CALayer()
-        guard let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) else { return layer }
+        updateSymbolLayer(layer, symbolName: symbolName, color: color)
+        layer.contentsGravity = .resizeAspect
+        layer.contentsScale = 2
+        return layer
+    }
+
+    private func updateSymbolLayer(_ layer: CALayer, symbolName: String, color: NSColor) {
+        guard let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) else { return }
         image.isTemplate = true
         let size = NSSize(width: 24, height: 24)
         let rendered = NSImage(size: size)
-        rendered.lockFocus()
-        color.set()
-        image.draw(in: NSRect(origin: .zero, size: size),
-                   from: .zero,
-                   operation: .sourceOver,
-                   fraction: 1)
-        rendered.unlockFocus()
+        appearance.performAsCurrentDrawingAppearance {
+            rendered.lockFocus()
+            image.draw(in: NSRect(origin: .zero, size: size),
+                       from: .zero,
+                       operation: .sourceOver,
+                       fraction: 1)
+            color.set()
+            NSRect(origin: .zero, size: size).fill(using: .sourceIn)
+            rendered.unlockFocus()
+        }
         var rect = NSRect(origin: .zero, size: size)
         layer.contents = rendered.cgImage(forProposedRect: &rect, context: nil, hints: nil)
         layer.contentsGravity = .resizeAspect
         layer.contentsScale = 2
-        return layer
     }
 
     private func makeTextLayer(size: CGFloat,
