@@ -617,6 +617,13 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         processSearchLayer.addSublayer(processSearchPlaceholderLayer)
         processSearchLayer.addSublayer(processSearchTextLayer)
         processSearchLayer.addSublayer(processSearchCursorLayer)
+        let processSearchNoActions = noImplicitLayerActions()
+        processSearchLayer.actions = processSearchNoActions
+        processSearchIconLayer.actions = processSearchNoActions
+        processSearchPlaceholderLayer.actions = processSearchNoActions
+        processSearchTextLayer.actions = processSearchNoActions
+        processSearchSelectionLayer.actions = processSearchNoActions
+        processSearchCursorLayer.actions = processSearchNoActions
         processSearchPlaceholderLayer.font = NSFont.systemFont(ofSize: 13, weight: .regular)
         processSearchPlaceholderLayer.fontSize = 13
         processSearchPlaceholderLayer.contentsScale = 2
@@ -1618,7 +1625,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         if filteredProcessIndices.isEmpty {
             let empty = makeTextLayer(size: 13, weight: .regular)
             empty.string = processSearchText.isEmpty ? "No processes." : "No matching processes."
-            empty.foregroundColor = NSColor.secondaryLabelColor.cgColor
+            empty.foregroundColor = resolvedCGColor(NSColor.secondaryLabelColor)
             empty.frame = CGRect(x: 14, y: max(contentHeight - 38, 8), width: max(viewport.width - 28, 1), height: 18)
             processContentLayer.addSublayer(empty)
             return
@@ -1630,19 +1637,20 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             let row = CALayer()
             row.frame = CGRect(x: 0, y: y, width: viewport.width, height: rowHeight)
             if process.pid == selectedPID {
-                row.backgroundColor = NSColor.selectedContentBackgroundColor.withAlphaComponent(0.28).cgColor
+                row.backgroundColor = resolvedCGColor(NSColor.selectedContentBackgroundColor.withAlphaComponent(0.28))
             } else if displayIndex % 2 == 1 {
-                row.backgroundColor = NSColor.labelColor.withAlphaComponent(0.035).cgColor
+                row.backgroundColor = resolvedCGColor(NSColor.labelColor.withAlphaComponent(0.035))
             }
 
             let pidLayer = makeTextLayer(size: 12, weight: .regular, alignment: .right)
             pidLayer.string = "\(process.pid)"
-            pidLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
+            pidLayer.foregroundColor = resolvedCGColor(NSColor.secondaryLabelColor)
             pidLayer.frame = CGRect(x: 12, y: 7, width: 58, height: 16)
             row.addSublayer(pidLayer)
 
             let nameLayer = makeTextLayer(size: 13, weight: .medium)
             nameLayer.string = process.name
+            nameLayer.foregroundColor = resolvedCGColor(NSColor.labelColor)
             nameLayer.frame = CGRect(x: 84, y: 7, width: max(row.bounds.width - 98, 1), height: 16)
             row.addSublayer(nameLayer)
 
@@ -1698,6 +1706,10 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func updateProcessSearchDisplay() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
+
         let bounds = processSearchLayer.bounds
         processSearchIconLayer.frame = CGRect(x: 10, y: 8, width: 16, height: 16)
         let textFrame = processSearchTextFrame()
@@ -1720,17 +1732,16 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         processSearchCursorLayer.frame = caretRect
         processSearchCursorLayer.isHidden = false
         processSearchCursorLayer.opacity = 1
-        if processSearchCursorLayer.animation(forKey: processSearchCaretBlinkAnimationKey) == nil {
-            let animation = CABasicAnimation(keyPath: "opacity")
-            animation.fromValue = 1
-            animation.toValue = 0
-            animation.duration = 0.55
-            animation.beginTime = CACurrentMediaTime() + 0.55
-            animation.autoreverses = true
-            animation.repeatCount = .infinity
-            animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            processSearchCursorLayer.add(animation, forKey: processSearchCaretBlinkAnimationKey)
-        }
+        processSearchCursorLayer.removeAnimation(forKey: processSearchCaretBlinkAnimationKey)
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = 1
+        animation.toValue = 0
+        animation.duration = 0.55
+        animation.beginTime = CACurrentMediaTime() + 0.55
+        animation.autoreverses = true
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        processSearchCursorLayer.add(animation, forKey: processSearchCaretBlinkAnimationKey)
     }
 
     private func updateProcessSearchSelectionLayer() {
@@ -2826,5 +2837,23 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         layer.alignmentMode = alignment
         layer.foregroundColor = NSColor.labelColor.cgColor
         return layer
+    }
+
+    private func noImplicitLayerActions() -> [String: CAAction] {
+        [
+            "backgroundColor": NSNull(),
+            "borderColor": NSNull(),
+            "borderWidth": NSNull(),
+            "bounds": NSNull(),
+            "contents": NSNull(),
+            "cornerRadius": NSNull(),
+            "foregroundColor": NSNull(),
+            "frame": NSNull(),
+            "hidden": NSNull(),
+            "isHidden": NSNull(),
+            "opacity": NSNull(),
+            "position": NSNull(),
+            "string": NSNull()
+        ]
     }
 }
