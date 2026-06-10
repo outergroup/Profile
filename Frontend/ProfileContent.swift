@@ -446,6 +446,8 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
                                      proxyPort: arguments.proxy?.port ?? 0,
                                      proxyUsername: arguments.proxy?.username,
                                      proxyPassword: arguments.proxy?.password)
+            outerframeHost.setTitle("Profile")
+            outerframeHost.setIcon(.bundleResource(path: "Contents/Resources/app-icon.png"))
             appearance = arguments.appearance ?? appearance
             currentSize = arguments.contentSize ?? currentSize
             configureNetworking()
