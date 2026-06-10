@@ -548,6 +548,12 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
                 deleteProcessSearchSelection()
             }
 
+        case .editCommandValidationRequest(let requestID, let commands):
+            outerframeHost.sendEditCommandValidationResponse(
+                requestID: requestID,
+                enabledCommands: enabledEditCommands(in: commands)
+            )
+
         case .pasteboardContentPasted(let items):
             insertProcessSearchPasteboardItems(items)
 
@@ -2003,12 +2009,6 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             OuterframeContextMenuItem(id: "paste",
                                       title: "Paste",
                                       keyEquivalent: "v",
-                                      keyEquivalentModifierMask: UInt32(truncatingIfNeeded: NSEvent.ModifierFlags.command.rawValue)),
-            OuterframeContextMenuItem(id: "separator", title: "", kind: .separator),
-            OuterframeContextMenuItem(id: "selectAll",
-                                      title: "Select All",
-                                      isEnabled: !processSearchText.isEmpty,
-                                      keyEquivalent: "a",
                                       keyEquivalentModifierMask: UInt32(truncatingIfNeeded: NSEvent.ModifierFlags.command.rawValue))
         ]
         outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
@@ -2022,8 +2022,6 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             writeProcessSearchSelectionToPasteboard(cut: false)
         case "paste":
             readPasteboardIntoProcessSearch()
-        case "selectAll":
-            selectAllProcessSearchText()
         default:
             break
         }
@@ -2076,8 +2074,6 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         let inputMode: OuterframeContentInputMode = processSearchFocused ? [.textInput, .rawKeys] : .rawKeys
         outerframeHost.setInputMode(inputMode)
         let hasSelection = processSearchSelectionRange() != nil
-        outerframeHost.setEditingCapabilities(canCopy: processSearchFocused && hasSelection,
-                                              canCut: processSearchFocused && hasSelection)
         outerframeHost.setAcceptedPasteboardPasteTypes(processSearchFocused ? processSearchPasteboardTypeIdentifiers : [])
         guard processSearchFocused, showingSetup else {
             outerframeHost.sendTextInputGeometryUpdate(nil)
@@ -2096,6 +2092,27 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
                                                                        width: rootCaretFrame.width,
                                                                        height: rootCaretFrame.height))
         outerframeHost.sendTextInputGeometryUpdate(geometry)
+    }
+
+    private func enabledEditCommands(in requestedCommands: OuterframeEditCommandSet) -> OuterframeEditCommandSet {
+        guard processSearchFocused else { return [] }
+
+        var enabledCommands: OuterframeEditCommandSet = []
+        if processSearchSelectionRange() != nil {
+            if requestedCommands.contains(.copy) {
+                enabledCommands.insert(.copy)
+            }
+            if requestedCommands.contains(.cut) {
+                enabledCommands.insert(.cut)
+            }
+        }
+        if requestedCommands.contains(.paste) {
+            enabledCommands.insert(.paste)
+        }
+        if requestedCommands.contains(.selectAll), !processSearchText.isEmpty {
+            enabledCommands.insert(.selectAll)
+        }
+        return enabledCommands
     }
 
     private var processSearchPasteboardTypeIdentifiers: [String] {
