@@ -47,6 +47,24 @@ private struct ProfileProcess {
     let command: String
 }
 
+private struct PerfConfigResponse {
+    let path: String
+    let usable: Bool
+    let message: String
+}
+
+private struct FilePickerResponse {
+    let path: String
+    let parent: String
+    let entries: [FilePickerEntry]
+}
+
+private struct FilePickerEntry {
+    let name: String
+    let path: String
+    let isDirectory: Bool
+}
+
 private struct ProfileResponse {
     let profileID: UInt64
     let pid: Int
@@ -185,6 +203,8 @@ private enum ProfileBinary {
     private static let profileListType: UInt32 = 2
     private static let recordingType: UInt32 = 3
     private static let profileType: UInt32 = 4
+    private static let perfConfigType: UInt32 = 5
+    private static let filePickerType: UInt32 = 6
 
     private static func reader(_ data: Data, type expectedType: UInt32) -> BinaryReader? {
         guard data.count >= 16 else { return nil }
@@ -339,10 +359,47 @@ private enum ProfileBinary {
                                timeline: timeline,
                                folded: folded)
     }
+
+    static func decodePerfConfig(_ data: Data) -> PerfConfigResponse? {
+        guard let reader = reader(data, type: perfConfigType),
+              let usable = reader.u32(at: 16),
+              let pathOffset = reader.u32(at: 20),
+              let pathLength = reader.u32(at: 24),
+              let messageOffset = reader.u32(at: 28),
+              let messageLength = reader.u32(at: 32),
+              let path = reader.string(offset: pathOffset, length: pathLength),
+              let message = reader.string(offset: messageOffset, length: messageLength) else { return nil }
+        return PerfConfigResponse(path: path, usable: usable != 0, message: message)
+    }
+
+    static func decodeFilePicker(_ data: Data) -> FilePickerResponse? {
+        guard let reader = reader(data, type: filePickerType),
+              let pathOffset = reader.u32(at: 16),
+              let pathLength = reader.u32(at: 20),
+              let parentOffset = reader.u32(at: 24),
+              let parentLength = reader.u32(at: 28),
+              let count = reader.u32(at: 32),
+              let rowsOffset = reader.u32(at: 36),
+              let path = reader.string(offset: pathOffset, length: pathLength),
+              let parent = reader.string(offset: parentOffset, length: parentLength) else { return nil }
+        var entries: [FilePickerEntry] = []
+        for index in 0..<Int(count) {
+            let row = Int(rowsOffset) + index * 32
+            guard let nameOffset = reader.u32(at: row),
+                  let nameLength = reader.u32(at: row + 4),
+                  let entryPathOffset = reader.u32(at: row + 8),
+                  let entryPathLength = reader.u32(at: row + 12),
+                  let flags = reader.u32(at: row + 16),
+                  let name = reader.string(offset: nameOffset, length: nameLength),
+                  let entryPath = reader.string(offset: entryPathOffset, length: entryPathLength) else { return nil }
+            entries.append(FilePickerEntry(name: name, path: entryPath, isDirectory: flags & 1 != 0))
+        }
+        return FilePickerResponse(path: path, parent: parent, entries: entries)
+    }
 }
 
 @MainActor
-private final class ProfileHandler: NSObject, OuterframeHostDelegate {
+private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLineTextInputControllerDelegate {
     private let outerframeHost: OuterframeHost
     private let appConnection: OuterframeAppConnection
     private var retainedSelf: ProfileHandler?
@@ -361,6 +418,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     private let processViewportLayer = CALayer()
     private let processContentLayer = CALayer()
     private let processScrollbarLayer = CALayer()
+    private let filePickerOverlayLayer = CALayer()
     private let traceViewportLayer = CALayer()
     private let traceContentLayer = CALayer()
     private let traceScrollbarLayer = CALayer()
@@ -386,6 +444,8 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     private var profileListEndpoint: URL?
     private var profileRangeEndpoint: URL?
     private var profileDeleteEndpoint: URL?
+    private var perfEndpoint: URL?
+    private var filePickerEndpoint: URL?
     private var hasRegisteredLayer = false
 
     private var traces: [ProfileSummary] = []
@@ -398,6 +458,17 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     private var processSearchCursorPosition = 0
     private var processSearchSelectionAnchor: Int?
     private var processSearchFocused = false
+    private var perfPath = "perf"
+    private var perfUsable = false
+    private var perfMessage = ""
+    private var perfSelectFrame = CGRect.zero
+    private var perfPathFrame = CGRect.zero
+    private var pendingFilePicker: FilePickerResponse?
+    private var filePickerPanelFrame = CGRect.zero
+    private var filePickerListFrame = CGRect.zero
+    private var filePickerCancelFrame = CGRect.zero
+    private var filePickerEntryFrames: [(frame: CGRect, entry: FilePickerEntry)] = []
+    private var filePickerScroll: CGFloat = 0
     private var filteredProcessIndices: [Int] = []
     private var showingSetup = true
     private var isBusy = false
@@ -420,6 +491,8 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     private var flameContentSize = CGSize.zero
     private var traceContextMenuTargets: [UUID: UInt64] = [:]
     private var processSearchContextMenuIDs: Set<UUID> = []
+    private var perfPathContextMenuIDs: Set<UUID> = []
+    private var currentCursor: PluginCursorType = .arrow
 
     private let toolbarHeight: CGFloat = 52
     private let sidebarWidth: CGFloat = 240
@@ -428,7 +501,20 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     private let runRowHeight: CGFloat = 56
     private let horizontalInset: CGFloat = 14
     private static let processSearchFieldID = UUID()
+    private static let perfPathFieldID = UUID()
     private let processSearchCaretBlinkAnimationKey = "processSearchCaretBlink"
+    private lazy var perfPathInputController: SingleLineTextInputController<ProfileHandler> = {
+        let controller = SingleLineTextInputController<ProfileHandler>(
+            identifier: Self.perfPathFieldID,
+            initialText: perfPath,
+            acceptedPasteboardTypeIdentifiers: processSearchPasteboardTypeIdentifiers
+        )
+        controller.delegate = self
+        controller.onSubmit = { [weak self] in
+            self?.commitPerfPathInput()
+        }
+        return controller
+    }()
 
     init(outerframeHost: OuterframeHost, appConnection: OuterframeAppConnection) {
         self.outerframeHost = outerframeHost
@@ -458,6 +544,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             outerframeHost.setInputMode(.rawKeys)
             fetchProfiles(selectLatestIfNeeded: true)
             fetchProcesses()
+            fetchPerfConfig()
 
         case .resizeContent(let size):
             currentSize = size
@@ -471,7 +558,11 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
 
         case .scrollWheelEvent(let point, let delta, _, _, _, let hasPreciseScrollingDeltas):
             let multiplier: CGFloat = hasPreciseScrollingDeltas ? 1 : rowHeight
-            if showingSetup, processListLayer.frame.contains(point) {
+            if pendingFilePicker != nil {
+                filePickerScroll -= delta.y * multiplier
+                clampFilePickerScroll()
+                renderFilePicker()
+            } else if showingSetup, processListLayer.frame.contains(point) {
                 processScroll -= delta.y * multiplier
                 clampProcessScroll()
                 updateProcessScrollPosition()
@@ -540,14 +631,14 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
 
         case .selectionToPasteboardCopyRequest(let requestID):
             outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
-                                                              items: processSearchPasteboardItems())
+                                                              items: selectedPasteboardItems())
 
         case .selectionToPasteboardCutRequest(let requestID):
-            let items = processSearchPasteboardItems()
+            let items = selectedPasteboardItems()
             outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
                                                               items: items)
             if !items.isEmpty {
-                deleteProcessSearchSelection()
+                cutFocusedSelection()
             }
 
         case .editCommandValidationRequest(let requestID, let commands):
@@ -557,7 +648,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             )
 
         case .pasteboardContentPasted(let items):
-            insertProcessSearchPasteboardItems(items)
+            insertPasteboardItemsIntoFocusedField(items)
 
         case .accessibilitySnapshotRequest(let requestID):
             outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID, snapshot: nil)
@@ -582,6 +673,8 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         profileListEndpoint = URL(string: "/api/profiles", relativeTo: base)?.absoluteURL
         profileRangeEndpoint = URL(string: "/api/profile/range", relativeTo: base)?.absoluteURL
         profileDeleteEndpoint = URL(string: "/api/profile/delete", relativeTo: base)?.absoluteURL
+        perfEndpoint = URL(string: "/api/perf", relativeTo: base)?.absoluteURL
+        filePickerEndpoint = URL(string: "/api/file-picker", relativeTo: base)?.absoluteURL
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 180
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
@@ -598,6 +691,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         rootLayer.addSublayer(timelineLayer)
         rootLayer.addSublayer(flameLayer)
         rootLayer.addSublayer(statusLayer)
+        rootLayer.addSublayer(filePickerOverlayLayer)
         rootLayer.addSublayer(tooltipLayer)
 
         processListLayer.addSublayer(processChromeLayer)
@@ -663,6 +757,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         tooltipTextLayer.alignmentMode = .left
         tooltipTextLayer.truncationMode = .end
         tooltipTextLayer.isWrapped = true
+        filePickerOverlayLayer.isHidden = true
     }
 
     private func registerRootLayerIfNeeded() {
@@ -691,6 +786,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             tooltipLayer.backgroundColor = tooltipBackgroundColor.cgColor
             tooltipLayer.borderColor = NSColor.separatorColor.cgColor
             tooltipTextLayer.foregroundColor = NSColor.labelColor.cgColor
+            renderFilePicker()
             refreshButtonLayer.isHidden = !showingSetup
             styleButton(refreshButtonLayer, enabled: showingSetup && !isBusy && !isRecording)
             styleRecordButton()
@@ -717,6 +813,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         processListLayer.frame = CGRect(x: contentX, y: 0, width: contentWidth, height: contentHeight)
         processChromeLayer.frame = processListLayer.bounds
         processScrollbarLayer.frame = processListLayer.bounds
+        filePickerOverlayLayer.frame = rootLayer.bounds
         timelineLayer.frame = CGRect(x: contentX,
                                      y: max(contentHeight - timelineHeight, 0),
                                      width: contentWidth,
@@ -741,6 +838,11 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func handleMouseDown(at point: CGPoint) {
+        if pendingFilePicker != nil {
+            handleFilePickerMouseDown(at: point)
+            return
+        }
+
         let toolbarPoint = toolbarLayer.convert(point, from: rootLayer)
         if showingSetup, refreshButtonLayer.frame.contains(toolbarPoint), !isBusy, !isRecording {
             fetchProcesses()
@@ -773,12 +875,23 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
 
         guard showingSetup, !isRecording else { return }
         let listPoint = processListLayer.convert(point, from: rootLayer)
+        if perfSelectFrame.contains(listPoint), !isBusy, !isRecording {
+            blurPerfPath(commit: true)
+            openPerfFilePicker()
+            return
+        }
+        if perfPathFrame.contains(listPoint) {
+            focusPerfPath(cursorPosition: perfPathCursorPosition(at: listPoint), modifySelection: false)
+            return
+        }
         if processSearchFrame().contains(listPoint) {
+            blurPerfPath(commit: true)
             focusProcessSearch(cursorPosition: processSearchCursorPosition(at: listPoint), modifySelection: false)
             return
         }
         if processListLayer.bounds.contains(listPoint), !processSearchFrame().contains(listPoint) {
             blurProcessSearch()
+            blurPerfPath(commit: true)
         }
         let listFrame = processTableFrame()
         guard listFrame.contains(listPoint) else { return }
@@ -812,8 +925,14 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         if showingSetup, processListLayer.frame.contains(point) {
             let listPoint = processListLayer.convert(point, from: rootLayer)
             if processSearchFrame().contains(listPoint) {
+                blurPerfPath(commit: true)
                 focusProcessSearch(cursorPosition: processSearchCursorPosition(at: listPoint), modifySelection: false)
                 showProcessSearchContextMenu(at: point)
+                return
+            }
+            if perfPathFrame.contains(listPoint) {
+                focusPerfPath(cursorPosition: perfPathCursorPosition(at: listPoint), modifySelection: false)
+                showPerfPathContextMenu(at: point)
                 return
             }
         }
@@ -835,6 +954,10 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     private func handleContextMenuSelection(menuID: UUID, itemID: String) {
         if processSearchContextMenuIDs.remove(menuID) != nil {
             handleProcessSearchContextMenuSelection(itemID: itemID)
+            return
+        }
+        if perfPathContextMenuIDs.remove(menuID) != nil {
+            handlePerfPathContextMenuSelection(itemID: itemID)
             return
         }
 
@@ -920,6 +1043,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func handleMouseMoved(at point: CGPoint) {
+        updateCursor(at: point)
         guard !showingSetup, flameLayer.frame.contains(point) else {
             hideTooltip()
             return
@@ -933,6 +1057,38 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         showTooltip(for: hit, at: point)
     }
 
+    private func updateCursor(at point: CGPoint) {
+        if pendingFilePicker != nil {
+            if filePickerCancelFrame.contains(point) ||
+                filePickerEntryFrames.contains(where: { $0.frame.contains(point) }) {
+                setCursorIfNeeded(.pointingHand)
+            } else {
+                setCursorIfNeeded(.arrow)
+            }
+            return
+        }
+
+        if showingSetup, processListLayer.frame.contains(point) {
+            let listPoint = processListLayer.convert(point, from: rootLayer)
+            if perfPathFrame.contains(listPoint) || processSearchFrame().contains(listPoint) {
+                setCursorIfNeeded(.iBeam)
+                return
+            }
+            if perfSelectFrame.contains(listPoint) {
+                setCursorIfNeeded(.pointingHand)
+                return
+            }
+        }
+
+        setCursorIfNeeded(.arrow)
+    }
+
+    private func setCursorIfNeeded(_ cursor: PluginCursorType) {
+        guard currentCursor != cursor else { return }
+        currentCursor = cursor
+        outerframeHost.setCursor(cursor)
+    }
+
     private func handleKeyDown(keyCode: UInt16,
                                characters: String,
                                charactersIgnoringModifiers: String,
@@ -942,27 +1098,35 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         _ = charactersIgnoringModifiers
         _ = modifierFlags
         _ = isARepeat
-        guard processSearchFocused else { return }
+        guard processSearchFocused || perfPathInputController.isFocused else { return }
         if modifierFlags.contains(.command) {
             switch charactersIgnoringModifiers.lowercased() {
             case "a":
-                selectAllProcessSearchText()
+                if processSearchFocused {
+                    selectAllProcessSearchText()
+                } else {
+                    perfPathInputController.selectAll()
+                }
             case "c":
-                writeProcessSearchSelectionToPasteboard(cut: false)
+                writeFocusedSelectionToPasteboard(cut: false)
             case "x":
-                writeProcessSearchSelectionToPasteboard(cut: true)
+                writeFocusedSelectionToPasteboard(cut: true)
             case "v":
-                readPasteboardIntoProcessSearch()
+                readPasteboardIntoFocusedField()
             default:
                 break
             }
             return
         }
         if keyCode == 53 {
-            if processSearchText.isEmpty {
-                blurProcessSearch()
+            if processSearchFocused {
+                if processSearchText.isEmpty {
+                    blurProcessSearch()
+                } else {
+                    setProcessSearchText("")
+                }
             } else {
-                setProcessSearchText("")
+                blurPerfPath(commit: true)
             }
         }
     }
@@ -971,6 +1135,19 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
                                  hasReplacementRange: Bool,
                                  replacementLocation: UInt64,
                                  replacementLength: UInt64) {
+        if perfPathInputController.isFocused {
+            guard !text.isEmpty else { return }
+            if hasReplacementRange {
+                let location = min(Int(replacementLocation), perfPathInputController.text.count)
+                let length = min(Int(replacementLength), perfPathInputController.text.count - location)
+                perfPathInputController.setCursorPosition(location, modifySelection: false)
+                if length > 0 {
+                    perfPathInputController.setCursorPosition(location + length, modifySelection: true)
+                }
+            }
+            perfPathInputController.insertText(text)
+            return
+        }
         guard processSearchFocused, !text.isEmpty else { return }
         let replacement: Range<Int>?
         if hasReplacementRange {
@@ -984,6 +1161,15 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func handleTextCommand(_ command: String) {
+        if perfPathInputController.isFocused {
+            let normalized = command.trimmingCharacters(in: CharacterSet(charactersIn: ":"))
+            if normalized == "cancelOperation" {
+                blurPerfPath(commit: true)
+            } else {
+                perfPathInputController.performCommand(normalized)
+            }
+            return
+        }
         guard processSearchFocused else { return }
         switch command.trimmingCharacters(in: CharacterSet(charactersIn: ":")) {
         case "deleteBackward":
@@ -1032,6 +1218,14 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func handleTextInputFocus(fieldID: UUID, hasFocus: Bool) {
+        if fieldID == Self.perfPathFieldID {
+            if hasFocus {
+                focusPerfPath(cursorPosition: perfPathInputController.cursorPosition, modifySelection: false)
+            } else {
+                blurPerfPath(commit: true)
+            }
+            return
+        }
         guard fieldID == Self.processSearchFieldID else { return }
         if hasFocus {
             focusProcessSearch(cursorPosition: processSearchCursorPosition, modifySelection: false)
@@ -1041,6 +1235,10 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func handleSetCursorPosition(fieldID: UUID, position: UInt64, modifySelection: Bool) {
+        if fieldID == Self.perfPathFieldID {
+            focusPerfPath(cursorPosition: min(Int(position), perfPathInputController.text.count), modifySelection: modifySelection)
+            return
+        }
         guard fieldID == Self.processSearchFieldID else { return }
         focusProcessSearch(cursorPosition: min(Int(position), processSearchText.count), modifySelection: modifySelection)
     }
@@ -1182,12 +1380,93 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         }.resume()
     }
 
+    private func fetchPerfConfig() {
+        guard let endpoint = perfEndpoint, let urlSession else { return }
+        urlSession.dataTask(with: endpoint) { [weak self] data, _, _ in
+            let result = data.flatMap(ProfileBinary.decodePerfConfig)
+            Task { @MainActor in
+                guard let self, let result else { return }
+                self.perfPath = result.path
+                self.perfUsable = result.usable
+                self.perfMessage = result.message
+                if !self.perfPathInputController.isFocused {
+                    self.perfPathInputController.setText(result.path)
+                }
+                self.updateProcessRows()
+            }
+        }.resume()
+    }
+
+    private func setPerfPath(_ path: String) {
+        guard let endpoint = perfEndpoint, let urlSession else { return }
+        var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "path", value: path)]
+        guard let url = components?.url else { return }
+        statusLayer.string = "Checking perf..."
+        urlSession.dataTask(with: url) { [weak self] data, _, error in
+            let result = data.flatMap(ProfileBinary.decodePerfConfig)
+            Task { @MainActor in
+                guard let self else { return }
+                if let result {
+                    self.perfPath = result.path
+                    self.perfUsable = result.usable
+                    self.perfMessage = result.message
+                    if !self.perfPathInputController.isFocused {
+                        self.perfPathInputController.setText(result.path)
+                    }
+                    self.statusLayer.string = result.usable ? "Using \(result.path)." : result.message
+                } else {
+                    self.statusLayer.string = error?.localizedDescription ?? "Could not set perf path."
+                }
+                self.updateColors()
+            }
+        }.resume()
+    }
+
+    private func openPerfFilePicker() {
+        blurProcessSearch()
+        let sourcePath = perfPathInputController.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let initialPath: String
+        if sourcePath.hasPrefix("/") {
+            let parent = (sourcePath as NSString).deletingLastPathComponent
+            initialPath = parent.isEmpty ? "/" : parent
+        } else {
+            initialPath = "/"
+        }
+        pendingFilePicker = FilePickerResponse(path: initialPath, parent: "/", entries: [])
+        filePickerScroll = 0
+        fetchFilePicker(path: initialPath)
+        renderFilePicker()
+    }
+
+    private func fetchFilePicker(path: String) {
+        guard let endpoint = filePickerEndpoint, let urlSession else { return }
+        var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "path", value: path)]
+        guard let url = components?.url else { return }
+        urlSession.dataTask(with: url) { [weak self] data, _, error in
+            let result = data.flatMap(ProfileBinary.decodeFilePicker)
+            Task { @MainActor in
+                guard let self, self.pendingFilePicker != nil else { return }
+                if let result {
+                    self.pendingFilePicker = result
+                    self.filePickerScroll = 0
+                } else {
+                    self.statusLayer.string = error?.localizedDescription ?? "Could not load directory."
+                }
+                self.renderFilePicker()
+            }
+        }.resume()
+    }
+
     private func startRecording() {
         guard !isRecording, let selectedPID, let profileStartEndpoint, let urlSession else { return }
+        commitPerfPathInput()
         var components = URLComponents(url: profileStartEndpoint, resolvingAgainstBaseURL: false)
         components?.queryItems = [
             URLQueryItem(name: "pid", value: String(selectedPID)),
-            URLQueryItem(name: "frequency", value: "999")
+            URLQueryItem(name: "frequency", value: "999"),
+            URLQueryItem(name: "perfPath", value: perfPathInputController.text.trimmingCharacters(in: .whitespacesAndNewlines))
         ]
         guard let url = components?.url else { return }
         isBusy = true
@@ -1575,6 +1854,8 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
             subhead.frame = CGRect(x: 24, y: processListLayer.bounds.height - 66, width: max(processListLayer.bounds.width - 48, 1), height: 18)
             processChromeLayer.addSublayer(subhead)
 
+            renderPerfPathRow()
+
             processSearchLayer.frame = processSearchFrame()
             processSearchLayer.cornerRadius = 7
             processChromeLayer.addSublayer(processSearchLayer)
@@ -1599,7 +1880,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
 
     private func processSearchFrame() -> CGRect {
         CGRect(x: 24,
-               y: processListLayer.bounds.height - 116,
+               y: processListLayer.bounds.height - 184,
                width: max(processListLayer.bounds.width - 48, 1),
                height: 34)
     }
@@ -1608,7 +1889,218 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         CGRect(x: 18,
                y: 18,
                width: max(processListLayer.bounds.width - 36, 1),
-               height: max(processListLayer.bounds.height - 148, 1))
+               height: max(processListLayer.bounds.height - 202, 1))
+    }
+
+    private func renderPerfPathRow() {
+        let y = processListLayer.bounds.height - 128
+        let label = makeTextLayer(size: 11, weight: .medium)
+        label.string = "Perf"
+        label.foregroundColor = resolvedCGColor(NSColor.secondaryLabelColor)
+        label.frame = CGRect(x: 24, y: y + 34, width: 80, height: 14)
+        processChromeLayer.addSublayer(label)
+
+        let buttonWidth: CGFloat = 72
+        perfSelectFrame = CGRect(x: max(processListLayer.bounds.width - 24 - buttonWidth, 24),
+                                 y: y,
+                                 width: buttonWidth,
+                                 height: 30)
+        perfPathFrame = CGRect(x: 24,
+                               y: y,
+                               width: max(perfSelectFrame.minX - 32, 80),
+                               height: 30)
+
+        let pathField = CALayer()
+        pathField.frame = perfPathFrame
+        pathField.cornerRadius = 6
+        pathField.masksToBounds = true
+        pathField.actions = noImplicitLayerActions()
+        pathField.borderWidth = 1
+        pathField.borderColor = resolvedCGColor(perfPathInputController.isFocused
+                                                ? NSColor.keyboardFocusIndicatorColor
+                                                : (perfUsable ? NSColor.separatorColor : NSColor.systemRed.withAlphaComponent(0.55)))
+        pathField.backgroundColor = resolvedCGColor(searchFieldBackgroundColor)
+        processChromeLayer.addSublayer(pathField)
+
+        let textFrame = perfPathTextFrame(fieldBounds: pathField.bounds)
+        let displayText = perfPathInputController.isFocused ? perfPathInputController.text : perfPath
+        if perfPathInputController.isFocused,
+           let range = perfPathInputController.selectionRange {
+            let line = makePerfPathLine(text: displayText)
+            let lower = offsetForCharacter(line: line,
+                                           index: range.lowerBound,
+                                           in: displayText,
+                                           maxWidth: textFrame.width)
+            let upper = offsetForCharacter(line: line,
+                                           index: range.upperBound,
+                                           in: displayText,
+                                           maxWidth: textFrame.width)
+            let selection = CALayer()
+            selection.actions = noImplicitLayerActions()
+            selection.frame = CGRect(x: textFrame.minX + min(lower, upper),
+                                     y: textFrame.minY + 1,
+                                     width: max(abs(upper - lower), 1),
+                                     height: textFrame.height - 2)
+            selection.cornerRadius = 2
+            selection.backgroundColor = resolvedCGColor(NSColor.selectedTextBackgroundColor.withAlphaComponent(isDarkMode ? 0.58 : 0.42))
+            pathField.addSublayer(selection)
+        }
+
+        let pathText = makeTextLayer(size: 12, weight: .regular)
+        pathText.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        pathText.actions = noImplicitLayerActions()
+        pathText.foregroundColor = resolvedCGColor(perfUsable ? NSColor.labelColor : NSColor.systemRed)
+        pathText.string = displayText
+        pathText.frame = textFrame
+        pathField.addSublayer(pathText)
+
+        if perfPathInputController.isFocused, perfPathInputController.selectionRange == nil {
+            let line = makePerfPathLine(text: displayText)
+            let offset = offsetForCharacter(line: line,
+                                            index: perfPathInputController.cursorPosition,
+                                            in: displayText,
+                                            maxWidth: textFrame.width)
+            let caret = CALayer()
+            caret.actions = noImplicitLayerActions()
+            caret.frame = CGRect(x: textFrame.minX + offset,
+                                 y: textFrame.minY + 1,
+                                 width: 1,
+                                 height: textFrame.height - 2)
+            caret.backgroundColor = resolvedCGColor(NSColor.labelColor)
+            pathField.addSublayer(caret)
+        }
+
+        let select = makeButtonLayer(title: "Select")
+        select.frame = perfSelectFrame
+        select.sublayers?.first?.frame = select.bounds.insetBy(dx: 10, dy: 6)
+        processChromeLayer.addSublayer(select)
+
+        if !perfMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let message = makeTextLayer(size: 11, weight: .regular)
+            message.string = perfUsable ? "perf is usable" : perfMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+            message.foregroundColor = resolvedCGColor(perfUsable ? NSColor.secondaryLabelColor : NSColor.systemRed)
+            message.frame = CGRect(x: 24, y: y - 18, width: max(processListLayer.bounds.width - 48, 1), height: 14)
+            processChromeLayer.addSublayer(message)
+        }
+    }
+
+    private func renderFilePicker() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        filePickerOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        filePickerEntryFrames.removeAll()
+        guard let picker = pendingFilePicker else {
+            filePickerOverlayLayer.isHidden = true
+            filePickerPanelFrame = .zero
+            filePickerListFrame = .zero
+            filePickerCancelFrame = .zero
+            CATransaction.commit()
+            return
+        }
+
+        filePickerOverlayLayer.isHidden = false
+        filePickerOverlayLayer.frame = rootLayer.bounds
+        filePickerOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.18))
+
+        let panelWidth = min(max(rootLayer.bounds.width - 56, 480), 760)
+        let panelHeight = min(max(rootLayer.bounds.height - 80, 340), 540)
+        let panel = CALayer()
+        filePickerPanelFrame = CGRect(x: floor((rootLayer.bounds.width - panelWidth) / 2),
+                                      y: floor((rootLayer.bounds.height - panelHeight) / 2),
+                                      width: panelWidth,
+                                      height: panelHeight)
+        panel.frame = filePickerPanelFrame
+        panel.cornerRadius = 8
+        panel.borderWidth = 1
+        panel.backgroundColor = resolvedCGColor(NSColor.windowBackgroundColor)
+        panel.borderColor = resolvedCGColor(NSColor.separatorColor)
+        filePickerOverlayLayer.addSublayer(panel)
+
+        let title = makeTextLayer(size: 15, weight: .semibold)
+        title.string = "Choose perf"
+        title.frame = CGRect(x: 18, y: panelHeight - 38, width: panelWidth - 36, height: 20)
+        panel.addSublayer(title)
+
+        let path = makeTextLayer(size: 12, weight: .regular)
+        path.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        path.foregroundColor = resolvedCGColor(NSColor.secondaryLabelColor)
+        path.string = picker.path
+        path.frame = CGRect(x: 18, y: panelHeight - 62, width: panelWidth - 36, height: 17)
+        panel.addSublayer(path)
+
+        let listFrame = CGRect(x: 18, y: 62, width: panelWidth - 36, height: max(panelHeight - 144, 80))
+        filePickerListFrame = listFrame.offsetBy(dx: filePickerPanelFrame.minX, dy: filePickerPanelFrame.minY)
+        let list = CALayer()
+        list.frame = listFrame
+        list.cornerRadius = 6
+        list.borderWidth = 1
+        list.borderColor = resolvedCGColor(NSColor.separatorColor)
+        list.backgroundColor = resolvedCGColor(tableBackgroundColor)
+        list.masksToBounds = true
+        panel.addSublayer(list)
+
+        let rowHeight: CGFloat = 28
+        let entries = [FilePickerEntry(name: "..", path: picker.parent, isDirectory: true)] + picker.entries
+        let contentHeight = max(CGFloat(entries.count) * rowHeight, listFrame.height)
+        clampFilePickerScroll(contentHeight: contentHeight, viewportHeight: listFrame.height)
+        let visibleStart = max(Int(floor(filePickerScroll / rowHeight)), 0)
+        let visibleEnd = min(entries.count, visibleStart + Int(ceil(listFrame.height / rowHeight)) + 2)
+        for index in visibleStart..<visibleEnd {
+            let entry = entries[index]
+            let y = listFrame.height - CGFloat(index + 1) * rowHeight + filePickerScroll
+            renderFilePickerRow(entry, in: list, localFrame: CGRect(x: 0, y: y, width: listFrame.width, height: rowHeight), listFrame: listFrame)
+        }
+
+        let cancel = makeButtonLayer(title: "Cancel")
+        cancel.frame = CGRect(x: panelWidth - 18 - 72, y: 20, width: 72, height: 30)
+        cancel.sublayers?.first?.frame = cancel.bounds.insetBy(dx: 10, dy: 6)
+        filePickerCancelFrame = cancel.frame.offsetBy(dx: filePickerPanelFrame.minX, dy: filePickerPanelFrame.minY)
+        panel.addSublayer(cancel)
+        CATransaction.commit()
+    }
+
+    private func renderFilePickerRow(_ entry: FilePickerEntry, in list: CALayer, localFrame: CGRect, listFrame: CGRect) {
+        filePickerEntryFrames.append((localFrame.offsetBy(dx: filePickerPanelFrame.minX + listFrame.minX,
+                                                          dy: filePickerPanelFrame.minY + listFrame.minY),
+                                      entry))
+        let row = CALayer()
+        row.frame = localFrame
+        list.addSublayer(row)
+
+        let icon = makeSymbolLayer(entry.isDirectory ? "folder" : "terminal", color: entry.isDirectory ? NSColor.controlAccentColor : NSColor.secondaryLabelColor)
+        icon.frame = CGRect(x: 18, y: 6, width: 16, height: 16)
+        row.addSublayer(icon)
+
+        let name = makeTextLayer(size: 12, weight: .regular)
+        name.string = entry.name
+        name.foregroundColor = resolvedCGColor(NSColor.labelColor)
+        name.frame = CGRect(x: 48, y: 6, width: max(localFrame.width - 58, 1), height: 16)
+        row.addSublayer(name)
+    }
+
+    private func handleFilePickerMouseDown(at point: CGPoint) {
+        if filePickerCancelFrame.contains(point) || !filePickerPanelFrame.contains(point) {
+            pendingFilePicker = nil
+            renderFilePicker()
+            return
+        }
+        guard filePickerListFrame.contains(point) else { return }
+        if let hit = filePickerEntryFrames.first(where: { $0.frame.contains(point) }) {
+            if hit.entry.isDirectory {
+                fetchFilePicker(path: hit.entry.path)
+            } else {
+                pendingFilePicker = nil
+                renderFilePicker()
+                perfPathInputController.setText(hit.entry.path)
+                setPerfPath(hit.entry.path)
+            }
+        }
+    }
+
+    private func clampFilePickerScroll(contentHeight: CGFloat? = nil, viewportHeight: CGFloat? = nil) {
+        let content = contentHeight ?? max(CGFloat(((pendingFilePicker?.entries.count ?? -1) + 1)) * rowHeight, 1)
+        let viewport = viewportHeight ?? max(filePickerListFrame.height, 1)
+        filePickerScroll = min(max(filePickerScroll, 0), max(content - viewport, 0))
     }
 
     private func filteredProcessIndexList() -> [Int] {
@@ -1822,7 +2314,61 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         return characterIndex(forUTF16: utf16Index, in: processSearchText)
     }
 
+    private func perfPathTextFrame(fieldBounds: CGRect) -> CGRect {
+        CGRect(x: 9,
+               y: 7,
+               width: max(fieldBounds.width - 18, 1),
+               height: 16)
+    }
+
+    private func makePerfPathLine(text: String) -> CTLine {
+        let attributed = NSAttributedString(string: text,
+                                            attributes: [.font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)])
+        return CTLineCreateWithAttributedString(attributed)
+    }
+
+    private func offsetForCharacter(line: CTLine, index: Int, in text: String, maxWidth: CGFloat) -> CGFloat {
+        let utf16Index = utf16Offset(forCharacterIndex: index, in: text)
+        var secondaryOffset: CGFloat = 0
+        let primary = CTLineGetOffsetForStringIndex(line, utf16Index, &secondaryOffset)
+        let offset = max(primary, secondaryOffset)
+        return offset.isFinite ? min(max(offset, 0), maxWidth) : 0
+    }
+
+    private func perfPathCursorPosition(at point: CGPoint) -> Int {
+        let textFrame = perfPathTextFrame(fieldBounds: perfPathFrame)
+        let localX = max(0, min(point.x - perfPathFrame.minX - textFrame.minX, textFrame.width))
+        let text = perfPathInputController.text
+        guard !text.isEmpty else { return 0 }
+        let line = makePerfPathLine(text: text)
+        let utf16Index = CTLineGetStringIndexForPosition(line, CGPoint(x: localX, y: 0))
+        guard utf16Index != kCFNotFound else { return text.count }
+        return characterIndex(forUTF16: utf16Index, in: text)
+    }
+
+    private func perfPathCaretRectInProcessList() -> CGRect {
+        let textFrame = perfPathTextFrame(fieldBounds: perfPathFrame)
+        let text = perfPathInputController.text
+        let offset: CGFloat
+        if text.isEmpty {
+            offset = 0
+        } else {
+            let line = makePerfPathLine(text: text)
+            offset = offsetForCharacter(line: line,
+                                        index: perfPathInputController.cursorPosition,
+                                        in: text,
+                                        maxWidth: textFrame.width)
+        }
+        return CGRect(x: perfPathFrame.minX + textFrame.minX + offset,
+                      y: perfPathFrame.minY + textFrame.minY + 1,
+                      width: 1,
+                      height: textFrame.height - 2)
+    }
+
     private func focusProcessSearch(cursorPosition: Int, modifySelection: Bool) {
+        if perfPathInputController.isFocused {
+            blurPerfPath(commit: true)
+        }
         processSearchFocused = true
         moveProcessSearchCursor(to: cursorPosition, modifySelection: modifySelection)
         updateProcessSearchDisplay()
@@ -1836,6 +2382,38 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         processSearchSelectionAnchor = nil
         updateProcessSearchDisplay()
         updateColors()
+        updateTextInputState()
+    }
+
+    private func focusPerfPath(cursorPosition: Int, modifySelection: Bool) {
+        blurProcessSearch()
+        perfPathInputController.focus()
+        perfPathInputController.setCursorPosition(cursorPosition, modifySelection: modifySelection)
+        updateProcessRows()
+        updateTextInputState()
+    }
+
+    private func blurPerfPath(commit: Bool) {
+        guard perfPathInputController.isFocused else { return }
+        if commit {
+            commitPerfPathInput()
+        }
+        perfPathInputController.blur()
+        updateProcessRows()
+        updateTextInputState()
+    }
+
+    private func commitPerfPathInput() {
+        let trimmed = perfPathInputController.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if trimmed != perfPath {
+            perfPath = trimmed
+            setPerfPath(trimmed)
+        }
+    }
+
+    func textInputControllerDidChangeState() {
+        updateProcessRows()
         updateTextInputState()
     }
 
@@ -2016,6 +2594,29 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
     }
 
+    private func showPerfPathContextMenu(at point: CGPoint) {
+        let menuID = UUID()
+        perfPathContextMenuIDs.insert(menuID)
+        let hasSelection = perfPathInputController.hasSelection
+        let items = [
+            OuterframeContextMenuItem(id: "cut",
+                                      title: "Cut",
+                                      isEnabled: hasSelection,
+                                      keyEquivalent: "x",
+                                      keyEquivalentModifierMask: UInt32(truncatingIfNeeded: NSEvent.ModifierFlags.command.rawValue)),
+            OuterframeContextMenuItem(id: "copy",
+                                      title: "Copy",
+                                      isEnabled: hasSelection,
+                                      keyEquivalent: "c",
+                                      keyEquivalentModifierMask: UInt32(truncatingIfNeeded: NSEvent.ModifierFlags.command.rawValue)),
+            OuterframeContextMenuItem(id: "paste",
+                                      title: "Paste",
+                                      keyEquivalent: "v",
+                                      keyEquivalentModifierMask: UInt32(truncatingIfNeeded: NSEvent.ModifierFlags.command.rawValue))
+        ]
+        outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
+    }
+
     private func handleProcessSearchContextMenuSelection(itemID: String) {
         switch itemID {
         case "cut":
@@ -2029,13 +2630,43 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         }
     }
 
-    private func processSearchPasteboardItems() -> [OuterContentPasteboardItem] {
-        guard let text = selectedProcessSearchText(),
-              let data = text.data(using: .utf8) else { return [] }
+    private func handlePerfPathContextMenuSelection(itemID: String) {
+        switch itemID {
+        case "cut":
+            writeFocusedSelectionToPasteboard(cut: true)
+        case "copy":
+            writeFocusedSelectionToPasteboard(cut: false)
+        case "paste":
+            readPasteboardIntoFocusedField()
+        default:
+            break
+        }
+    }
+
+    private func textPasteboardItems(_ text: String?) -> [OuterContentPasteboardItem] {
+        guard let text, let data = text.data(using: .utf8) else { return [] }
         return [OuterContentPasteboardItem(representations: [
             OuterContentPasteboardRepresentation(typeIdentifier: NSPasteboard.PasteboardType.string.rawValue,
                                                  data: data)
         ])]
+    }
+
+    private func processSearchPasteboardItems() -> [OuterContentPasteboardItem] {
+        textPasteboardItems(selectedProcessSearchText())
+    }
+
+    private func perfPathPasteboardItems() -> [OuterContentPasteboardItem] {
+        textPasteboardItems(perfPathInputController.selectedTextContent())
+    }
+
+    private func selectedPasteboardItems() -> [OuterContentPasteboardItem] {
+        if processSearchFocused {
+            return processSearchPasteboardItems()
+        }
+        if perfPathInputController.isFocused {
+            return perfPathPasteboardItems()
+        }
+        return []
     }
 
     private func writeProcessSearchSelectionToPasteboard(cut: Bool) {
@@ -2047,10 +2678,39 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         }
     }
 
+    private func writeFocusedSelectionToPasteboard(cut: Bool) {
+        if processSearchFocused {
+            writeProcessSearchSelectionToPasteboard(cut: cut)
+            return
+        }
+        guard perfPathInputController.isFocused else { return }
+        let items = perfPathPasteboardItems()
+        guard !items.isEmpty else { return }
+        outerframeHost.requestPasteboardWrite(items: items) { [weak self] granted in
+            guard granted, cut else { return }
+            _ = self?.perfPathInputController.cutSelectedTextContent()
+        }
+    }
+
+    private func cutFocusedSelection() {
+        if processSearchFocused {
+            deleteProcessSearchSelection()
+        } else if perfPathInputController.isFocused {
+            _ = perfPathInputController.cutSelectedTextContent()
+        }
+    }
+
     private func readPasteboardIntoProcessSearch() {
         outerframeHost.requestPasteboardRead(typeIdentifiers: processSearchPasteboardTypeIdentifiers) { [weak self] granted, items in
             guard granted else { return }
             self?.insertProcessSearchPasteboardItems(items)
+        }
+    }
+
+    private func readPasteboardIntoFocusedField() {
+        outerframeHost.requestPasteboardRead(typeIdentifiers: processSearchPasteboardTypeIdentifiers) { [weak self] granted, items in
+            guard granted else { return }
+            self?.insertPasteboardItemsIntoFocusedField(items)
         }
     }
 
@@ -2072,16 +2732,60 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
         }
     }
 
+    private func insertPasteboardItemsIntoFocusedField(_ items: [OuterContentPasteboardItem]) {
+        if processSearchFocused {
+            insertProcessSearchPasteboardItems(items)
+            return
+        }
+        guard perfPathInputController.isFocused else { return }
+        for item in items {
+            for representation in item.representations {
+                if representation.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue,
+                   let string = String(data: representation.data, encoding: .utf8) {
+                    perfPathInputController.insertText(string)
+                    return
+                }
+                if representation.typeIdentifier == NSPasteboard.PasteboardType.rtf.rawValue,
+                   let attributed = NSAttributedString(rtf: representation.data, documentAttributes: nil) {
+                    perfPathInputController.insertText(attributed.string)
+                    return
+                }
+            }
+        }
+    }
+
     private func updateTextInputState() {
-        let inputMode: OuterframeContentInputMode = processSearchFocused ? [.textInput, .rawKeys] : .rawKeys
+        let perfPathFocused = perfPathInputController.isFocused
+        let inputMode: OuterframeContentInputMode = (processSearchFocused || perfPathFocused) ? [.textInput, .rawKeys] : .rawKeys
         outerframeHost.setInputMode(inputMode)
-        let hasSelection = processSearchSelectionRange() != nil
-        outerframeHost.setAcceptedPasteboardPasteTypes(processSearchFocused ? processSearchPasteboardTypeIdentifiers : [])
-        guard processSearchFocused, showingSetup else {
+        outerframeHost.setAcceptedPasteboardPasteTypes((processSearchFocused || perfPathFocused) ? processSearchPasteboardTypeIdentifiers : [])
+        guard showingSetup else {
             outerframeHost.sendTextInputGeometryUpdate(nil)
             return
         }
-        guard !hasSelection else {
+
+        if perfPathFocused {
+            guard perfPathInputController.selectionRange == nil else {
+                outerframeHost.sendTextInputGeometryUpdate(nil)
+                return
+            }
+            let caretFrame = perfPathCaretRectInProcessList()
+            let rootCaretFrame = processListLayer.convert(caretFrame, to: rootLayer)
+            let topLeftY = rootLayer.bounds.height - rootCaretFrame.origin.y - rootCaretFrame.height
+            let geometry = OuterframeContentTextInputGeometry(fieldID: Self.perfPathFieldID,
+                                                              rect: CGRect(x: rootCaretFrame.origin.x,
+                                                                           y: topLeftY,
+                                                                           width: rootCaretFrame.width,
+                                                                           height: rootCaretFrame.height))
+            outerframeHost.sendTextInputGeometryUpdate(geometry)
+            return
+        }
+
+        guard processSearchFocused else {
+            outerframeHost.sendTextInputGeometryUpdate(nil)
+            return
+        }
+        guard processSearchSelectionRange() == nil else {
             outerframeHost.sendTextInputGeometryUpdate(nil)
             return
         }
@@ -2097,6 +2801,9 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     }
 
     private func enabledEditCommands(in requestedCommands: OuterframeEditCommandSet) -> OuterframeEditCommandSet {
+        if perfPathInputController.isFocused {
+            return perfPathInputController.enabledEditCommands(in: requestedCommands)
+        }
         guard processSearchFocused else { return [] }
 
         var enabledCommands: OuterframeEditCommandSet = []
@@ -2813,6 +3520,14 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate {
     private func makeButtonLabel(_ title: String) -> CATextLayer {
         let layer = makeTextLayer(size: 13, weight: .medium, alignment: .center)
         layer.string = title
+        return layer
+    }
+
+    private func makeButtonLayer(title: String, enabled: Bool = true) -> CALayer {
+        let layer = CALayer()
+        layer.addSublayer(makeButtonLabel(title))
+        layer.sublayers?.first?.frame = layer.bounds.insetBy(dx: 10, dy: 6)
+        styleButton(layer, enabled: enabled)
         return layer
     }
 

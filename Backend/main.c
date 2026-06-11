@@ -37,6 +37,8 @@
 #define PROFILE_BINARY_PROFILE_LIST 2
 #define PROFILE_BINARY_RECORDING 3
 #define PROFILE_BINARY_PROFILE 4
+#define PROFILE_BINARY_PERF_CONFIG 5
+#define PROFILE_BINARY_FILE_PICKER 6
 
 static const unsigned char kProfileBinaryMagic[4] = {'P', 'R', 'F', 'L'};
 static const char *kProfileBinaryContentType = "application/vnd.outer-profile+binary";
@@ -50,6 +52,7 @@ static const char *kBundleFilePathMacosX86 = "ProfileContent.bundle.macos-x86.aa
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
 static char g_backend_label[256] = "dev.outergroup.Profile";
+static char g_perf_path[PATH_MAX] = "";
 static volatile sig_atomic_t g_shutdown_requested = 0;
 static volatile sig_atomic_t g_listener_fd = -1;
 static bool g_systemd_socket_activation = false;
@@ -140,6 +143,13 @@ typedef struct {
     bool have_cpu_ticks_before;
     double start_time;
 } RecordingRun;
+
+typedef struct {
+    char name[NAME_MAX + 1];
+    char path[PATH_MAX];
+    bool is_directory;
+    uint64_t size;
+} FilePickerEntry;
 
 static ProfileStore g_profiles = {0};
 static RecordingRun g_recording = {0};
@@ -280,7 +290,7 @@ static bool sb_append_binary_header(StringBuilder *builder, uint32_t type) {
 }
 
 static void send_outer_descriptor(int fd) {
-    const char *plugin_payload = "{\"processesAPIPath\":\"/api/processes\",\"profileAPIPath\":\"/api/profile\",\"profileStartAPIPath\":\"/api/profile/start\",\"profileStopAPIPath\":\"/api/profile/stop\",\"profileStatusAPIPath\":\"/api/profile/status\",\"profileListAPIPath\":\"/api/profiles\",\"profileRangeAPIPath\":\"/api/profile/range\",\"profileDeleteAPIPath\":\"/api/profile/delete\"}";
+    const char *plugin_payload = "{\"processesAPIPath\":\"/api/processes\",\"profileAPIPath\":\"/api/profile\",\"profileStartAPIPath\":\"/api/profile/start\",\"profileStopAPIPath\":\"/api/profile/stop\",\"profileStatusAPIPath\":\"/api/profile/status\",\"profileListAPIPath\":\"/api/profiles\",\"profileRangeAPIPath\":\"/api/profile/range\",\"profileDeleteAPIPath\":\"/api/profile/delete\",\"perfAPIPath\":\"/api/perf\",\"filePickerAPIPath\":\"/api/file-picker\"}";
     size_t path_len = strlen(kBundleUrlPath);
     size_t plugin_len = strlen(plugin_payload);
     size_t header_len = 40;
@@ -516,6 +526,54 @@ static bool collect_processes(ProcessList *list) {
     qsort(list->items, list->count, sizeof(ProcessRow), compare_process_rows);
     return true;
 #endif
+}
+
+static void expand_tilde_path(const char *input, char *output, size_t output_size) {
+    if (!output || output_size == 0) return;
+    const char *path = input && input[0] ? input : "~";
+    if (path[0] == '~' && (path[1] == '\0' || path[1] == '/')) {
+        const char *home = getenv("HOME");
+        if (!home || !home[0]) home = "/";
+        snprintf(output, output_size, "%s%s", home, path + 1);
+    } else {
+        snprintf(output, output_size, "%s", path);
+    }
+}
+
+static void parent_path_for(const char *path, char *parent, size_t parent_size) {
+    if (!parent || parent_size == 0) return;
+    if (!path || !path[0] || strcmp(path, "/") == 0) {
+        snprintf(parent, parent_size, "/");
+        return;
+    }
+    char copy[PATH_MAX];
+    snprintf(copy, sizeof(copy), "%s", path);
+    size_t len = strlen(copy);
+    while (len > 1 && copy[len - 1] == '/') copy[--len] = '\0';
+    char *slash = strrchr(copy, '/');
+    if (!slash) {
+        snprintf(parent, parent_size, ".");
+    } else if (slash == copy) {
+        snprintf(parent, parent_size, "/");
+    } else {
+        *slash = '\0';
+        snprintf(parent, parent_size, "%s", copy);
+    }
+}
+
+static bool join_child_path(const char *directory, const char *name, char *output, size_t output_size) {
+    if (!directory || !name || !output || output_size == 0) return false;
+    int written = strcmp(directory, "/") == 0
+        ? snprintf(output, output_size, "/%s", name)
+        : snprintf(output, output_size, "%s/%s", directory, name);
+    return written > 0 && (size_t)written < output_size;
+}
+
+static int compare_file_picker_entries(const void *lhs, const void *rhs) {
+    const FilePickerEntry *a = lhs;
+    const FilePickerEntry *b = rhs;
+    if (a->is_directory != b->is_directory) return a->is_directory ? -1 : 1;
+    return strcasecmp(a->name, b->name);
 }
 
 static void free_frame_array(char **frames, size_t depth) {
@@ -813,6 +871,7 @@ static int compare_aggregates_desc(const void *a, const void *b) {
 }
 
 static const char *find_perf_binary(void) {
+    if (g_perf_path[0]) return g_perf_path;
     static const char *candidates[] = {"/usr/bin/perf", "/bin/perf", "/usr/local/bin/perf", NULL};
     for (int i = 0; candidates[i]; i++) {
         if (access(candidates[i], X_OK) == 0) return candidates[i];
@@ -820,10 +879,118 @@ static const char *find_perf_binary(void) {
     return "perf";
 }
 
+static void copy_first_nonempty_line(const char *text, char *dst, size_t dst_size) {
+    if (!dst || dst_size == 0) return;
+    dst[0] = '\0';
+    if (!text) return;
+    const char *p = text;
+    while (*p) {
+        while (*p == '\n' || *p == '\r') p++;
+        const char *line_start = p;
+        while (*p && *p != '\n' && *p != '\r') p++;
+        const char *line_end = p;
+        while (line_start < line_end && isspace((unsigned char)*line_start)) line_start++;
+        while (line_end > line_start && isspace((unsigned char)line_end[-1])) line_end--;
+        if (line_end > line_start) {
+            size_t len = (size_t)(line_end - line_start);
+            if (len >= dst_size) len = dst_size - 1;
+            memcpy(dst, line_start, len);
+            dst[len] = '\0';
+            return;
+        }
+    }
+}
+
+static bool check_perf_available(const char *perf, char *message, size_t message_size) {
+    if (message && message_size > 0) message[0] = '\0';
+    int pipe_fds[2];
+    if (pipe(pipe_fds) != 0) {
+        if (message && message_size > 0) snprintf(message, message_size, "failed to create perf check pipe: %s", strerror(errno));
+        return false;
+    }
+
+    pid_t child = fork();
+    if (child < 0) {
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        if (message && message_size > 0) snprintf(message, message_size, "failed to start perf check: %s", strerror(errno));
+        return false;
+    }
+
+    if (child == 0) {
+        close(pipe_fds[0]);
+        dup2(pipe_fds[1], STDOUT_FILENO);
+        dup2(pipe_fds[1], STDERR_FILENO);
+        if (pipe_fds[1] > STDERR_FILENO) close(pipe_fds[1]);
+        execlp(perf, perf, "--version", (char *)NULL);
+        _exit(127);
+    }
+
+    close(pipe_fds[1]);
+    char output[2048];
+    size_t used = 0;
+    while (used + 1 < sizeof(output)) {
+        ssize_t got = read(pipe_fds[0], output + used, sizeof(output) - used - 1);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (got == 0) break;
+        used += (size_t)got;
+    }
+    output[used] = '\0';
+    close(pipe_fds[0]);
+
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) return true;
+
+    char detail[1024];
+    copy_first_nonempty_line(output, detail, sizeof(detail));
+    if (message && message_size > 0) {
+        if (detail[0]) {
+            snprintf(message, message_size, "perf is not installed or is not usable: %s\n", detail);
+        } else if (WIFEXITED(status)) {
+            snprintf(message, message_size, "perf is not installed or is not usable: perf --version exited with status %d\n", WEXITSTATUS(status));
+        } else if (WIFSIGNALED(status)) {
+            snprintf(message, message_size, "perf is not installed or is not usable: perf --version was terminated by signal %d\n", WTERMSIG(status));
+        } else {
+            snprintf(message, message_size, "perf is not installed or is not usable.\n");
+        }
+    }
+    return false;
+}
+
 static char *read_whole_file_or_empty(const char *path) {
     char *text = read_text_file(path, 65536);
     if (!text) return strdup("");
     return text;
+}
+
+static void log_perf_diagnostic(const char *context, const char *detail) {
+    char first_line[1024];
+    copy_first_nonempty_line(detail, first_line, sizeof(first_line));
+    if (first_line[0]) {
+        fprintf(stderr, "ProfileBackend %s: %s\n", context ? context : "perf error", first_line);
+    } else {
+        fprintf(stderr, "ProfileBackend %s\n", context ? context : "perf error");
+    }
+    fflush(stderr);
+}
+
+static void log_perf_command_failure(const char *context, int status, const char *output) {
+    char first_line[1024];
+    copy_first_nonempty_line(output, first_line, sizeof(first_line));
+    if (first_line[0]) {
+        fprintf(stderr, "ProfileBackend %s: %s\n", context, first_line);
+    } else if (WIFEXITED(status)) {
+        fprintf(stderr, "ProfileBackend %s: exited with status %d\n", context, WEXITSTATUS(status));
+    } else if (WIFSIGNALED(status)) {
+        fprintf(stderr, "ProfileBackend %s: terminated by signal %d\n", context, WTERMSIG(status));
+    } else {
+        fprintf(stderr, "ProfileBackend %s\n", context);
+    }
+    fflush(stderr);
 }
 
 static void cleanup_temp_dir(const char *dir) {
@@ -864,6 +1031,8 @@ typedef struct {
     uint32_t base_offset;
 } BinaryStringTable;
 
+static bool send_binary_builder(int fd, StringBuilder *binary);
+
 static bool binary_add_string(BinaryStringTable *table, const char *text, uint32_t *offset_out, uint32_t *length_out) {
     size_t length = strlen(text ? text : "");
     if (table->base_offset > UINT32_MAX - table->strings.length || length > UINT32_MAX) return false;
@@ -877,6 +1046,141 @@ static bool binary_add_string_n(BinaryStringTable *table, const char *text, size
     if (offset_out) *offset_out = table->base_offset + (uint32_t)table->strings.length;
     if (length_out) *length_out = (uint32_t)length;
     return sb_append_n(&table->strings, text ? text : "", length);
+}
+
+static void send_perf_config_binary(int fd) {
+    const char *perf = find_perf_binary();
+    char check_message[1024];
+    bool usable = check_perf_available(perf, check_message, sizeof(check_message));
+    const uint32_t header_size = 44;
+    BinaryStringTable string_table = {.base_offset = header_size};
+    uint32_t path_offset = 0, path_length = 0, message_offset = 0, message_length = 0;
+    bool ok = binary_add_string(&string_table, perf, &path_offset, &path_length) &&
+              binary_add_string(&string_table, check_message, &message_offset, &message_length);
+    StringBuilder binary = {0};
+    ok = ok &&
+         sb_append_binary_header(&binary, PROFILE_BINARY_PERF_CONFIG) &&
+         sb_append_u32(&binary, usable ? 1 : 0) &&
+         sb_append_u32(&binary, path_offset) &&
+         sb_append_u32(&binary, path_length) &&
+         sb_append_u32(&binary, message_offset) &&
+         sb_append_u32(&binary, message_length) &&
+         sb_append_u32(&binary, header_size) &&
+         sb_append_u32(&binary, (uint32_t)string_table.strings.length) &&
+         sb_append_n(&binary, string_table.strings.data, string_table.strings.length);
+    free(string_table.strings.data);
+    if (!ok) {
+        free(binary.data);
+        send_text_response(fd, 500, "out of memory\n");
+        return;
+    }
+    send_binary_builder(fd, &binary);
+}
+
+static void send_file_picker_binary(int fd, const char *query) {
+    char requested[PATH_MAX] = "";
+    char expanded[PATH_MAX];
+    query_value(query, "path", requested, sizeof(requested));
+    expand_tilde_path(requested[0] ? requested : "/", expanded, sizeof(expanded));
+    if (expanded[0] != '/') {
+        snprintf(expanded, sizeof(expanded), "/");
+    }
+
+    DIR *dir = opendir(expanded);
+    if (!dir) {
+        char fallback[PATH_MAX];
+        parent_path_for(expanded, fallback, sizeof(fallback));
+        dir = opendir(fallback);
+        if (dir) snprintf(expanded, sizeof(expanded), "%s", fallback);
+    }
+    if (!dir) {
+        char message[PATH_MAX + 64];
+        snprintf(message, sizeof(message), "failed to open %s: %s\n", expanded, strerror(errno));
+        send_text_response(fd, 404, message);
+        return;
+    }
+
+    FilePickerEntry *entries = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+        char child_path[PATH_MAX];
+        if (!join_child_path(expanded, entry->d_name, child_path, sizeof(child_path))) continue;
+        struct stat st;
+        if (stat(child_path, &st) != 0 && lstat(child_path, &st) != 0) continue;
+        bool is_directory = S_ISDIR(st.st_mode);
+        if (!is_directory && !S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) continue;
+        if (count == capacity) {
+            size_t new_capacity = capacity ? capacity * 2 : 64;
+            FilePickerEntry *new_entries = realloc(entries, new_capacity * sizeof(FilePickerEntry));
+            if (!new_entries) {
+                free(entries);
+                closedir(dir);
+                send_text_response(fd, 500, "out of memory\n");
+                return;
+            }
+            entries = new_entries;
+            capacity = new_capacity;
+        }
+        FilePickerEntry *item = &entries[count++];
+        memset(item, 0, sizeof(*item));
+        snprintf(item->name, sizeof(item->name), "%s", entry->d_name);
+        snprintf(item->path, sizeof(item->path), "%s", child_path);
+        item->is_directory = is_directory;
+        item->size = (uint64_t)st.st_size;
+    }
+    closedir(dir);
+    qsort(entries, count, sizeof(FilePickerEntry), compare_file_picker_entries);
+
+    char parent[PATH_MAX];
+    parent_path_for(expanded, parent, sizeof(parent));
+
+    const uint32_t header_size = 48;
+    const uint32_t row_size = 32;
+    uint32_t rows_offset = header_size;
+    uint32_t strings_offset = rows_offset + (uint32_t)count * row_size;
+    BinaryStringTable string_table = {.base_offset = strings_offset};
+    uint32_t path_offset = 0, path_length = 0, parent_offset = 0, parent_length = 0;
+    StringBuilder rows = {0};
+    bool ok = binary_add_string(&string_table, expanded, &path_offset, &path_length) &&
+              binary_add_string(&string_table, parent, &parent_offset, &parent_length);
+    for (size_t i = 0; ok && i < count; i++) {
+        uint32_t name_offset = 0, name_length = 0, entry_path_offset = 0, entry_path_length = 0;
+        ok = binary_add_string(&string_table, entries[i].name, &name_offset, &name_length) &&
+             binary_add_string(&string_table, entries[i].path, &entry_path_offset, &entry_path_length) &&
+             sb_append_u32(&rows, name_offset) &&
+             sb_append_u32(&rows, name_length) &&
+             sb_append_u32(&rows, entry_path_offset) &&
+             sb_append_u32(&rows, entry_path_length) &&
+             sb_append_u32(&rows, entries[i].is_directory ? 1 : 0) &&
+             sb_append_u32(&rows, 0) &&
+             sb_append_u64(&rows, entries[i].size);
+    }
+    free(entries);
+
+    StringBuilder binary = {0};
+    ok = ok &&
+         sb_append_binary_header(&binary, PROFILE_BINARY_FILE_PICKER) &&
+         sb_append_u32(&binary, path_offset) &&
+         sb_append_u32(&binary, path_length) &&
+         sb_append_u32(&binary, parent_offset) &&
+         sb_append_u32(&binary, parent_length) &&
+         sb_append_u32(&binary, (uint32_t)count) &&
+         sb_append_u32(&binary, rows_offset) &&
+         sb_append_u32(&binary, strings_offset) &&
+         sb_append_u32(&binary, (uint32_t)string_table.strings.length) &&
+         sb_append_n(&binary, rows.data, rows.length) &&
+         sb_append_n(&binary, string_table.strings.data, string_table.strings.length);
+    free(rows.data);
+    free(string_table.strings.data);
+    if (!ok) {
+        free(binary.data);
+        send_text_response(fd, 500, "out of memory\n");
+        return;
+    }
+    send_binary_builder(fd, &binary);
 }
 
 static uint32_t timeline_bucket_count_for_run(const ProfileRun *run) {
@@ -1235,7 +1539,7 @@ static ProfileRun *install_completed_profile_run(uint64_t requested_id,
     }
 
     const char *status = "";
-    char status_buffer[256] = "";
+    char status_buffer[512] = "";
     if (samples.count == 0) {
         if (perf_record_status_ok(record_status) && perf_script_status_ok(script_status)) {
             if (have_cpu_milliseconds) {
@@ -1247,14 +1551,37 @@ static ProfileRun *install_completed_profile_run(uint64_t requested_id,
             } else {
                 status = "perf ran successfully, but the selected process did not run on CPU during the recording.";
             }
+        } else if (!perf_record_status_ok(record_status) && record_output && record_output[0]) {
+            char detail[384];
+            copy_first_nonempty_line(record_output, detail, sizeof(detail));
+            if (detail[0]) {
+                snprintf(status_buffer, sizeof(status_buffer), "perf record failed: %s", detail);
+                status = status_buffer;
+            } else {
+                status = "perf record failed.";
+            }
         } else if (script_error && script_error[0]) {
-            status = "perf completed, but could not decode stack samples.";
+            char detail[384];
+            copy_first_nonempty_line(script_error, detail, sizeof(detail));
+            if (detail[0]) {
+                snprintf(status_buffer, sizeof(status_buffer), "perf script failed: %s", detail);
+                status = status_buffer;
+            } else {
+                status = "perf completed, but could not decode stack samples.";
+            }
         } else if ((!record_output || !record_output[0]) &&
                    (!script_error || !script_error[0])) {
             status = "perf completed, but did not produce stack samples.";
         } else {
             status = "perf completed, but did not produce stack samples.";
         }
+    }
+    if (!perf_record_status_ok(record_status)) {
+        log_perf_command_failure("perf record failed", record_status, record_output);
+    } else if (!perf_script_status_ok(script_status)) {
+        log_perf_command_failure("perf script failed", script_status, script_error);
+    } else if (!parsed && script_error && script_error[0]) {
+        log_perf_diagnostic("perf script output was not decoded", script_error);
     }
 
     ProfileRun run = {
@@ -1311,6 +1638,12 @@ static void send_profile_capture(int fd, const char *query) {
     if (frequency > 999) frequency = 999;
 
     const char *perf = find_perf_binary();
+    char perf_error[1024];
+    if (!check_perf_available(perf, perf_error, sizeof(perf_error))) {
+        log_perf_diagnostic("perf availability check failed", perf_error);
+        send_text_response(fd, 500, perf_error[0] ? perf_error : "perf is not installed or is not usable.\n");
+        return;
+    }
     char temp_template[] = "/tmp/outer-profile-XXXXXX";
     char *temp_dir = mkdtemp(temp_template);
     if (!temp_dir) {
@@ -1412,6 +1745,10 @@ static void send_profile_start(int fd, const char *query) {
     if (query_value(query, "frequency", value, sizeof(value))) frequency = atoi(value);
     if (frequency < 19) frequency = 19;
     if (frequency > 999) frequency = 999;
+    char perf_path[PATH_MAX];
+    if (query_value(query, "perfPath", perf_path, sizeof(perf_path)) && perf_path[0]) {
+        snprintf(g_perf_path, sizeof(g_perf_path), "%s", perf_path);
+    }
 
     char temp_template[] = "/tmp/outer-profile-XXXXXX";
     char *temp_dir = mkdtemp(temp_template);
@@ -1434,6 +1771,13 @@ static void send_profile_start(int fd, const char *query) {
     snprintf(recording.script_err, sizeof(recording.script_err), "%s/script.err", temp_dir);
 
     const char *perf = find_perf_binary();
+    char perf_error[1024];
+    if (!check_perf_available(perf, perf_error, sizeof(perf_error))) {
+        log_perf_diagnostic("perf availability check failed", perf_error);
+        cleanup_temp_dir(temp_dir);
+        send_text_response(fd, 500, perf_error[0] ? perf_error : "perf is not installed or is not usable.\n");
+        return;
+    }
     char frequency_text[32], pid_text[32];
     snprintf(frequency_text, sizeof(frequency_text), "%d", frequency);
     snprintf(pid_text, sizeof(pid_text), "%d", pid);
@@ -1649,6 +1993,14 @@ static void handle_client(int fd) {
         send_profile_range(fd, query ? query : "");
     } else if (strcmp(target, "/api/profile/delete") == 0) {
         send_profile_delete(fd, query ? query : "");
+    } else if (strcmp(target, "/api/perf") == 0) {
+        char path[PATH_MAX] = "";
+        if (query_value(query ? query : "", "path", path, sizeof(path))) {
+            snprintf(g_perf_path, sizeof(g_perf_path), "%s", path);
+        }
+        send_perf_config_binary(fd);
+    } else if (strcmp(target, "/api/file-picker") == 0) {
+        send_file_picker_binary(fd, query ? query : "");
     } else {
         send_text_response(fd, 404, "not found\n");
     }
