@@ -51,12 +51,20 @@ private struct PerfConfigResponse {
     let path: String
     let usable: Bool
     let message: String
+    let machineUnsupported: Bool
 }
 
 private struct FilePickerResponse {
     let path: String
     let parent: String
     let entries: [FilePickerEntry]
+}
+
+private struct MachineUnsupportedTextLine {
+    let text: String
+    let range: Range<Int>
+    let frame: CGRect
+    let font: NSFont
 }
 
 private struct FilePickerEntry {
@@ -369,7 +377,12 @@ private enum ProfileBinary {
               let messageLength = reader.u32(at: 32),
               let path = reader.string(offset: pathOffset, length: pathLength),
               let message = reader.string(offset: messageOffset, length: messageLength) else { return nil }
-        return PerfConfigResponse(path: path, usable: usable != 0, message: message)
+        let headerSize = reader.u32(at: 36) ?? 44
+        let machineUnsupported = headerSize >= 48 ? ((reader.u32(at: 44) ?? 0) != 0) : false
+        return PerfConfigResponse(path: path,
+                                  usable: usable != 0,
+                                  message: message,
+                                  machineUnsupported: machineUnsupported)
     }
 
     static func decodeFilePicker(_ data: Data) -> FilePickerResponse? {
@@ -434,6 +447,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     private let recordToggleButtonLayer = CALayer()
     private let tooltipLayer = CALayer()
     private let tooltipTextLayer = CATextLayer()
+    private let machineUnsupportedOverlayLayer = CALayer()
 
     private var currentSize = CGSize(width: 1100, height: 720)
     private var appearance = NSAppearance.currentDrawing()
@@ -461,6 +475,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     private var perfPath = "perf"
     private var perfUsable = false
     private var perfMessage = ""
+    private var perfMachineUnsupported = false
     private var perfSelectFrame = CGRect.zero
     private var perfPathFrame = CGRect.zero
     private var pendingFilePicker: FilePickerResponse?
@@ -470,6 +485,12 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     private var filePickerEntryFrames: [(frame: CGRect, entry: FilePickerEntry)] = []
     private var filePickerScroll: CGFloat = 0
     private var filteredProcessIndices: [Int] = []
+    private var machineUnsupportedPanelFrame = CGRect.zero
+    private var machineUnsupportedTextLines: [MachineUnsupportedTextLine] = []
+    private var machineUnsupportedSelectionAnchor: Int?
+    private var machineUnsupportedSelectionFocus: Int?
+    private var isSelectingMachineUnsupportedText = false
+    private var machineUnsupportedContextMenuIDs = Set<UUID>()
     private var showingSetup = true
     private var isBusy = false
     private var isRecording = false
@@ -557,6 +578,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             updateColors()
 
         case .scrollWheelEvent(let point, let delta, _, _, _, let hasPreciseScrollingDeltas):
+            guard !perfMachineUnsupported else { return }
             let multiplier: CGFloat = hasPreciseScrollingDeltas ? 1 : rowHeight
             if pendingFilePicker != nil {
                 filePickerScroll -= delta.y * multiplier
@@ -582,26 +604,50 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             }
 
         case .magnification(_, let magnification, let location, _):
+            guard !perfMachineUnsupported else { return }
             handleMagnification(magnification, at: location)
 
         case .magnificationEnded(_, _, _, _):
+            guard !perfMachineUnsupported else { return }
             clampFlameScroll()
             commitFlameZoomLayout()
             updateFlameScrollPosition()
 
         case .mouseDown(let point, _, _):
+            if perfMachineUnsupported {
+                handleMachineUnsupportedMouseDown(at: point)
+                return
+            }
             handleMouseDown(at: point)
 
         case .mouseDragged(let point, _):
+            if perfMachineUnsupported {
+                handleMachineUnsupportedMouseDragged(at: point)
+                return
+            }
             handleMouseDragged(at: point)
 
         case .mouseUp(let point, _):
+            if perfMachineUnsupported {
+                handleMachineUnsupportedMouseUp(at: point)
+                return
+            }
             handleMouseUp(at: point)
 
         case .mouseMoved(let point, _):
+            if perfMachineUnsupported {
+                setCursorIfNeeded(machineUnsupportedCharacterIndex(at: point) == nil ? .arrow : .iBeam)
+                return
+            }
             handleMouseMoved(at: point)
 
         case .keyDown(let keyCode, let characters, let charactersIgnoringModifiers, let modifierFlags, let isARepeat):
+            if perfMachineUnsupported {
+                handleMachineUnsupportedKeyDown(charactersIgnoringModifiers: charactersIgnoringModifiers,
+                                                modifierFlags: modifierFlags)
+                return
+            }
+            guard !perfMachineUnsupported else { return }
             handleKeyDown(keyCode: keyCode,
                           characters: characters,
                           charactersIgnoringModifiers: charactersIgnoringModifiers,
@@ -609,24 +655,36 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                           isARepeat: isARepeat)
 
         case .textInput(let text, let hasReplacementRange, let replacementLocation, let replacementLength):
+            guard !perfMachineUnsupported else { return }
             handleTextInput(text,
                             hasReplacementRange: hasReplacementRange,
                             replacementLocation: replacementLocation,
                             replacementLength: replacementLength)
 
         case .textCommand(let command):
+            guard !perfMachineUnsupported else { return }
             handleTextCommand(command)
 
         case .textInputFocus(let fieldID, let hasFocus):
+            guard !perfMachineUnsupported else { return }
             handleTextInputFocus(fieldID: fieldID, hasFocus: hasFocus)
 
         case .setCursorPosition(let fieldID, let position, let modifySelection):
+            guard !perfMachineUnsupported else { return }
             handleSetCursorPosition(fieldID: fieldID, position: position, modifySelection: modifySelection)
 
         case .rightMouseDown(let point, _, _):
+            if perfMachineUnsupported {
+                showMachineUnsupportedContextMenu(at: point)
+                return
+            }
             handleRightMouseDown(at: point)
 
         case .contextMenuItemSelected(let menuID, let itemID):
+            if perfMachineUnsupported {
+                handleMachineUnsupportedContextMenuSelection(menuID: menuID, itemID: itemID)
+                return
+            }
             handleContextMenuSelection(menuID: menuID, itemID: itemID)
 
         case .selectionToPasteboardCopyRequest(let requestID):
@@ -634,6 +692,10 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                                                               items: selectedPasteboardItems())
 
         case .selectionToPasteboardCutRequest(let requestID):
+            guard !perfMachineUnsupported else {
+                outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID, items: [])
+                return
+            }
             let items = selectedPasteboardItems()
             outerframeHost.sendCopySelectedPasteboardResponse(requestID: requestID,
                                                               items: items)
@@ -642,12 +704,18 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             }
 
         case .editCommandValidationRequest(let requestID, let commands):
+            guard !perfMachineUnsupported else {
+                outerframeHost.sendEditCommandValidationResponse(requestID: requestID,
+                                                                 enabledCommands: enabledEditCommands(in: commands))
+                return
+            }
             outerframeHost.sendEditCommandValidationResponse(
                 requestID: requestID,
                 enabledCommands: enabledEditCommands(in: commands)
             )
 
         case .pasteboardContentPasted(let items):
+            guard !perfMachineUnsupported else { return }
             insertPasteboardItemsIntoFocusedField(items)
 
         case .accessibilitySnapshotRequest(let requestID):
@@ -693,6 +761,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         rootLayer.addSublayer(statusLayer)
         rootLayer.addSublayer(filePickerOverlayLayer)
         rootLayer.addSublayer(tooltipLayer)
+        rootLayer.addSublayer(machineUnsupportedOverlayLayer)
 
         processListLayer.addSublayer(processChromeLayer)
         processListLayer.addSublayer(processViewportLayer)
@@ -758,6 +827,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         tooltipTextLayer.truncationMode = .end
         tooltipTextLayer.isWrapped = true
         filePickerOverlayLayer.isHidden = true
+        machineUnsupportedOverlayLayer.isHidden = true
     }
 
     private func registerRootLayerIfNeeded() {
@@ -787,6 +857,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             tooltipLayer.borderColor = NSColor.separatorColor.cgColor
             tooltipTextLayer.foregroundColor = NSColor.labelColor.cgColor
             renderFilePicker()
+            renderMachineUnsupportedOverlay()
             refreshButtonLayer.isHidden = !showingSetup
             styleButton(refreshButtonLayer, enabled: showingSetup && !isBusy && !isRecording)
             styleRecordButton()
@@ -814,6 +885,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         processChromeLayer.frame = processListLayer.bounds
         processScrollbarLayer.frame = processListLayer.bounds
         filePickerOverlayLayer.frame = rootLayer.bounds
+        machineUnsupportedOverlayLayer.frame = rootLayer.bounds
         timelineLayer.frame = CGRect(x: contentX,
                                      y: max(contentHeight - timelineHeight, 0),
                                      width: contentWidth,
@@ -835,6 +907,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         updateProcessRows()
         updateTimeline()
         updateFlameGraph()
+        renderMachineUnsupportedOverlay()
     }
 
     private func handleMouseDown(at point: CGPoint) {
@@ -1371,13 +1444,21 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                         self.selectedPID = nil
                     }
                     self.clampProcessScroll()
-                    self.statusLayer.string = self.selectedPID == nil ? "Choose a process for the next recording." : self.statusLayer.string
+                    self.statusLayer.string = self.selectedPID == nil ? self.nextRecordingStatusText() : self.statusLayer.string
                     self.updateColors()
                 } else {
                     self.statusLayer.string = error?.localizedDescription ?? "Could not load processes."
                 }
             }
         }.resume()
+    }
+
+    private func nextRecordingStatusText() -> String {
+        let message = perfMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !perfUsable && !message.isEmpty {
+            return message
+        }
+        return "Choose a process for the next recording."
     }
 
     private func fetchPerfConfig() {
@@ -1389,10 +1470,14 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                 self.perfPath = result.path
                 self.perfUsable = result.usable
                 self.perfMessage = result.message
+                self.perfMachineUnsupported = result.machineUnsupported
                 if !self.perfPathInputController.isFocused {
                     self.perfPathInputController.setText(result.path)
                 }
-                self.updateProcessRows()
+                if self.showingSetup, self.selectedPID == nil {
+                    self.statusLayer.string = self.nextRecordingStatusText()
+                }
+                self.updateLayout()
             }
         }.resume()
     }
@@ -1411,6 +1496,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                     self.perfPath = result.path
                     self.perfUsable = result.usable
                     self.perfMessage = result.message
+                    self.perfMachineUnsupported = result.machineUnsupported
                     if !self.perfPathInputController.isFocused {
                         self.perfPathInputController.setText(result.path)
                     }
@@ -1460,7 +1546,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     }
 
     private func startRecording() {
-        guard !isRecording, let selectedPID, let profileStartEndpoint, let urlSession else { return }
+        guard !isRecording, perfUsable, !perfMachineUnsupported, let selectedPID, let profileStartEndpoint, let urlSession else { return }
         commitPerfPathInput()
         var components = URLComponents(url: profileStartEndpoint, resolvingAgainstBaseURL: false)
         components?.queryItems = [
@@ -1854,8 +1940,6 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             subhead.frame = CGRect(x: 24, y: processListLayer.bounds.height - 66, width: max(processListLayer.bounds.width - 48, 1), height: 18)
             processChromeLayer.addSublayer(subhead)
 
-            renderPerfPathRow()
-
             processSearchLayer.frame = processSearchFrame()
             processSearchLayer.cornerRadius = 7
             processChromeLayer.addSublayer(processSearchLayer)
@@ -1873,6 +1957,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             rebuildProcessContent()
             updateProcessSearchDisplay()
             updateProcessScrollPosition()
+            renderPerfPathRow()
             CATransaction.commit()
         }
         updateTextInputState()
@@ -1880,24 +1965,27 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
 
     private func processSearchFrame() -> CGRect {
         CGRect(x: 24,
-               y: processListLayer.bounds.height - 184,
+               y: processListLayer.bounds.height - 116,
                width: max(processListLayer.bounds.width - 48, 1),
                height: 34)
     }
 
     private func processTableFrame() -> CGRect {
-        CGRect(x: 18,
-               y: 18,
-               width: max(processListLayer.bounds.width - 36, 1),
-               height: max(processListLayer.bounds.height - 202, 1))
+        let search = processSearchFrame()
+        let tableY: CGFloat = 92
+        let tableTop = search.minY - 12
+        return CGRect(x: 18,
+                      y: tableY,
+                      width: max(processListLayer.bounds.width - 36, 1),
+                      height: max(tableTop - tableY, 1))
     }
 
     private func renderPerfPathRow() {
-        let y = processListLayer.bounds.height - 128
+        let y: CGFloat = 22
         let label = makeTextLayer(size: 11, weight: .medium)
-        label.string = "Perf"
+        label.string = "Path to perf executable"
         label.foregroundColor = resolvedCGColor(NSColor.secondaryLabelColor)
-        label.frame = CGRect(x: 24, y: y + 34, width: 80, height: 14)
+        label.frame = CGRect(x: 24, y: y + 34, width: max(processListLayer.bounds.width - 48, 1), height: 14)
         processChromeLayer.addSublayer(label)
 
         let buttonWidth: CGFloat = 72
@@ -1981,6 +2069,279 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             message.foregroundColor = resolvedCGColor(perfUsable ? NSColor.secondaryLabelColor : NSColor.systemRed)
             message.frame = CGRect(x: 24, y: y - 18, width: max(processListLayer.bounds.width - 48, 1), height: 14)
             processChromeLayer.addSublayer(message)
+        }
+    }
+
+    private func renderMachineUnsupportedOverlay() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        machineUnsupportedOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        machineUnsupportedTextLines.removeAll()
+        machineUnsupportedOverlayLayer.frame = rootLayer.bounds
+        guard perfMachineUnsupported else {
+            machineUnsupportedOverlayLayer.isHidden = true
+            machineUnsupportedPanelFrame = .zero
+            CATransaction.commit()
+            return
+        }
+
+        machineUnsupportedOverlayLayer.isHidden = false
+        machineUnsupportedOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(isDarkMode ? 0.42 : 0.24))
+
+        let panelWidth = min(max(rootLayer.bounds.width * 0.58, 420), 680)
+        let panelHeight: CGFloat = 198
+        let panel = CALayer()
+        machineUnsupportedPanelFrame = CGRect(x: floor((rootLayer.bounds.width - panelWidth) / 2),
+                                              y: floor((rootLayer.bounds.height - panelHeight) / 2),
+                                              width: panelWidth,
+                                              height: panelHeight)
+        panel.frame = machineUnsupportedPanelFrame
+        panel.cornerRadius = 12
+        panel.borderWidth = 1
+        panel.borderColor = resolvedCGColor(NSColor.systemRed.withAlphaComponent(isDarkMode ? 0.55 : 0.42))
+        panel.backgroundColor = resolvedCGColor(NSColor.windowBackgroundColor)
+        panel.shadowColor = NSColor.black.cgColor
+        panel.shadowOpacity = isDarkMode ? 0.36 : 0.18
+        panel.shadowRadius = 24
+        panel.shadowOffset = CGSize(width: 0, height: -8)
+        machineUnsupportedOverlayLayer.addSublayer(panel)
+
+        let icon = makeSymbolLayer("exclamationmark.triangle.fill", color: NSColor.systemRed, renderSize: 64)
+        icon.frame = CGRect(x: 24, y: panelHeight - 62, width: 32, height: 32)
+        panel.addSublayer(icon)
+
+        let title = makeTextLayer(size: 18, weight: .semibold)
+        title.string = "Profile cannot be used on this machine"
+        title.foregroundColor = resolvedCGColor(NSColor.labelColor)
+        title.frame = CGRect(x: 68, y: panelHeight - 56, width: max(panelWidth - 92, 1), height: 24)
+        panel.addSublayer(title)
+
+        let message = perfMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        let bodyText = message.isEmpty
+            ? "This machine does not support the Linux perf events that Profile needs to record stack samples."
+            : message
+        let bodyFrame = CGRect(x: 24, y: 28, width: max(panelWidth - 48, 1), height: panelHeight - 104)
+        renderMachineUnsupportedSelectableText(bodyText, in: bodyFrame, on: panel)
+
+        CATransaction.commit()
+    }
+
+    private func renderMachineUnsupportedSelectableText(_ text: String, in frame: CGRect, on panel: CALayer) {
+        let font = NSFont.systemFont(ofSize: 13, weight: .regular)
+        let lines = wrappedMachineUnsupportedTextLines(text, font: font, frame: frame)
+        machineUnsupportedTextLines = lines
+        if let range = machineUnsupportedSelectionRange() {
+            for line in lines {
+                guard let intersection = intersectRanges(range, line.range),
+                      intersection.lowerBound < intersection.upperBound else { continue }
+                let highlight = CALayer()
+                highlight.actions = noImplicitLayerActions()
+                highlight.frame = selectionRect(for: intersection, in: line)
+                highlight.cornerRadius = 2
+                highlight.backgroundColor = resolvedCGColor(NSColor.selectedTextBackgroundColor.withAlphaComponent(isDarkMode ? 0.62 : 0.44))
+                panel.addSublayer(highlight)
+            }
+        }
+        for line in lines {
+            let layer = makeTextLayer(size: 13, weight: .regular)
+            layer.string = line.text
+            layer.foregroundColor = resolvedCGColor(NSColor.secondaryLabelColor)
+            layer.frame = line.frame
+            panel.addSublayer(layer)
+        }
+    }
+
+    private func wrappedMachineUnsupportedTextLines(_ text: String,
+                                                    font: NSFont,
+                                                    frame: CGRect) -> [MachineUnsupportedTextLine] {
+        guard !text.isEmpty else { return [] }
+        let attributed = NSAttributedString(string: text, attributes: [.font: font])
+        let typesetter = CTTypesetterCreateWithAttributedString(attributed)
+        let nsText = text as NSString
+        let lineHeight: CGFloat = 17
+        let maxLines = max(Int(floor(frame.height / lineHeight)), 1)
+        var utf16Start = 0
+        var result: [MachineUnsupportedTextLine] = []
+        while utf16Start < nsText.length, result.count < maxLines {
+            var length = CTTypesetterSuggestLineBreak(typesetter, utf16Start, Double(frame.width))
+            if length <= 0 { length = 1 }
+            let nsRange = NSRange(location: utf16Start, length: min(length, nsText.length - utf16Start))
+            var lineText = nsText.substring(with: nsRange)
+            while lineText.hasSuffix("\n") || lineText.hasSuffix("\r") {
+                lineText.removeLast()
+            }
+            let charStart = characterIndex(forUTF16: nsRange.location, in: text)
+            let charEnd = characterIndex(forUTF16: nsRange.location + nsRange.length, in: text)
+            let y = frame.maxY - CGFloat(result.count + 1) * lineHeight
+            result.append(MachineUnsupportedTextLine(text: lineText,
+                                                     range: charStart..<charEnd,
+                                                     frame: CGRect(x: frame.minX,
+                                                                   y: y,
+                                                                   width: frame.width,
+                                                                   height: lineHeight),
+                                                     font: font))
+            utf16Start += nsRange.length
+        }
+        return result
+    }
+
+    private func machineUnsupportedSelectionRange() -> Range<Int>? {
+        guard let anchor = machineUnsupportedSelectionAnchor,
+              let focus = machineUnsupportedSelectionFocus,
+              anchor != focus else { return nil }
+        return min(anchor, focus)..<max(anchor, focus)
+    }
+
+    private func intersectRanges(_ first: Range<Int>, _ second: Range<Int>) -> Range<Int>? {
+        let lower = max(first.lowerBound, second.lowerBound)
+        let upper = min(first.upperBound, second.upperBound)
+        guard lower < upper else { return nil }
+        return lower..<upper
+    }
+
+    private func selectionRect(for range: Range<Int>, in line: MachineUnsupportedTextLine) -> CGRect {
+        let lineObject = CTLineCreateWithAttributedString(NSAttributedString(string: line.text, attributes: [.font: line.font]))
+        let lowerIndex = min(max(range.lowerBound - line.range.lowerBound, 0), line.text.count)
+        let upperIndex = min(max(range.upperBound - line.range.lowerBound, 0), line.text.count)
+        let lower = offsetForCharacter(line: lineObject,
+                                       index: lowerIndex,
+                                       in: line.text,
+                                       maxWidth: line.frame.width)
+        let upper = offsetForCharacter(line: lineObject,
+                                       index: upperIndex,
+                                       in: line.text,
+                                       maxWidth: line.frame.width)
+        return CGRect(x: line.frame.minX + min(lower, upper),
+                      y: line.frame.minY + 1,
+                      width: max(abs(upper - lower), 1),
+                      height: line.frame.height - 2)
+    }
+
+    private func machineUnsupportedBodyText() -> String {
+        let message = perfMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        return message.isEmpty
+            ? "This machine does not support the Linux perf events that Profile needs to record stack samples."
+            : message
+    }
+
+    private func machineUnsupportedCharacterIndex(at point: CGPoint) -> Int? {
+        guard perfMachineUnsupported,
+              !machineUnsupportedPanelFrame.isEmpty,
+              machineUnsupportedPanelFrame.contains(point) else { return nil }
+        let localPoint = CGPoint(x: point.x - machineUnsupportedPanelFrame.minX,
+                                 y: point.y - machineUnsupportedPanelFrame.minY)
+        guard !machineUnsupportedTextLines.isEmpty else { return nil }
+
+        if localPoint.y >= machineUnsupportedTextLines[0].frame.maxY {
+            return machineUnsupportedTextLines[0].range.lowerBound
+        }
+        if localPoint.y <= machineUnsupportedTextLines[machineUnsupportedTextLines.count - 1].frame.minY {
+            return machineUnsupportedTextLines[machineUnsupportedTextLines.count - 1].range.upperBound
+        }
+
+        let line = machineUnsupportedTextLines.first(where: { $0.frame.insetBy(dx: 0, dy: -2).contains(localPoint) })
+        guard let line else { return nil }
+        let clampedX = min(max(localPoint.x - line.frame.minX, 0), line.frame.width)
+        guard !line.text.isEmpty else { return line.range.lowerBound }
+        let lineObject = CTLineCreateWithAttributedString(NSAttributedString(string: line.text, attributes: [.font: line.font]))
+        let utf16Index = CTLineGetStringIndexForPosition(lineObject, CGPoint(x: clampedX, y: 0))
+        if utf16Index == kCFNotFound {
+            return clampedX > line.frame.width * 0.5 ? line.range.upperBound : line.range.lowerBound
+        }
+        return min(line.range.upperBound,
+                   line.range.lowerBound + characterIndex(forUTF16: utf16Index, in: line.text))
+    }
+
+    private func handleMachineUnsupportedMouseDown(at point: CGPoint) {
+        guard let index = machineUnsupportedCharacterIndex(at: point) else {
+            clearMachineUnsupportedSelection()
+            return
+        }
+        machineUnsupportedSelectionAnchor = index
+        machineUnsupportedSelectionFocus = index
+        isSelectingMachineUnsupportedText = true
+        renderMachineUnsupportedOverlay()
+    }
+
+    private func handleMachineUnsupportedMouseDragged(at point: CGPoint) {
+        guard isSelectingMachineUnsupportedText else { return }
+        machineUnsupportedSelectionFocus = machineUnsupportedCharacterIndex(at: point)
+            ?? (point.y < machineUnsupportedPanelFrame.midY ? machineUnsupportedBodyText().count : 0)
+        renderMachineUnsupportedOverlay()
+    }
+
+    private func handleMachineUnsupportedMouseUp(at point: CGPoint) {
+        guard isSelectingMachineUnsupportedText else { return }
+        isSelectingMachineUnsupportedText = false
+        if let index = machineUnsupportedCharacterIndex(at: point) {
+            machineUnsupportedSelectionFocus = index
+        }
+        renderMachineUnsupportedOverlay()
+    }
+
+    private func clearMachineUnsupportedSelection() {
+        machineUnsupportedSelectionAnchor = nil
+        machineUnsupportedSelectionFocus = nil
+        isSelectingMachineUnsupportedText = false
+        renderMachineUnsupportedOverlay()
+    }
+
+    private func machineUnsupportedSelectedText() -> String? {
+        guard let range = machineUnsupportedSelectionRange() else { return nil }
+        let text = machineUnsupportedBodyText()
+        let lower = min(max(range.lowerBound, 0), text.count)
+        let upper = min(max(range.upperBound, lower), text.count)
+        let start = text.index(text.startIndex, offsetBy: lower)
+        let end = text.index(text.startIndex, offsetBy: upper)
+        let selected = String(text[start..<end])
+        return selected.isEmpty ? nil : selected
+    }
+
+    private func machineUnsupportedPasteboardItems() -> [OuterContentPasteboardItem] {
+        textPasteboardItems(machineUnsupportedSelectedText())
+    }
+
+    private func writeMachineUnsupportedSelectionToPasteboard() {
+        let items = machineUnsupportedPasteboardItems()
+        guard !items.isEmpty else { return }
+        outerframeHost.requestPasteboardWrite(items: items) { _ in }
+    }
+
+    private func handleMachineUnsupportedKeyDown(charactersIgnoringModifiers: String,
+                                                 modifierFlags: NSEvent.ModifierFlags) {
+        guard modifierFlags.contains(.command) else { return }
+        switch charactersIgnoringModifiers.lowercased() {
+        case "c":
+            writeMachineUnsupportedSelectionToPasteboard()
+        case "a":
+            machineUnsupportedSelectionAnchor = 0
+            machineUnsupportedSelectionFocus = machineUnsupportedBodyText().count
+            renderMachineUnsupportedOverlay()
+        default:
+            break
+        }
+    }
+
+    private func showMachineUnsupportedContextMenu(at point: CGPoint) {
+        if machineUnsupportedCharacterIndex(at: point) == nil, machineUnsupportedSelectedText() == nil {
+            return
+        }
+        let menuID = UUID()
+        machineUnsupportedContextMenuIDs.insert(menuID)
+        let items = [
+            OuterframeContextMenuItem(id: "copy",
+                                      title: "Copy",
+                                      isEnabled: machineUnsupportedSelectedText() != nil,
+                                      keyEquivalent: "c",
+                                      keyEquivalentModifierMask: UInt32(truncatingIfNeeded: NSEvent.ModifierFlags.command.rawValue))
+        ]
+        outerframeHost.showContextMenu(menuID: menuID, items: items, at: point)
+    }
+
+    private func handleMachineUnsupportedContextMenuSelection(menuID: UUID, itemID: String) {
+        guard machineUnsupportedContextMenuIDs.remove(menuID) != nil else { return }
+        if itemID == "copy" {
+            writeMachineUnsupportedSelectionToPasteboard()
         }
     }
 
@@ -2660,6 +3021,9 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     }
 
     private func selectedPasteboardItems() -> [OuterContentPasteboardItem] {
+        if perfMachineUnsupported {
+            return machineUnsupportedPasteboardItems()
+        }
         if processSearchFocused {
             return processSearchPasteboardItems()
         }
@@ -2755,6 +3119,12 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     }
 
     private func updateTextInputState() {
+        if perfMachineUnsupported {
+            outerframeHost.setInputMode(.rawKeys)
+            outerframeHost.setAcceptedPasteboardPasteTypes([])
+            outerframeHost.sendTextInputGeometryUpdate(nil)
+            return
+        }
         let perfPathFocused = perfPathInputController.isFocused
         let inputMode: OuterframeContentInputMode = (processSearchFocused || perfPathFocused) ? [.textInput, .rawKeys] : .rawKeys
         outerframeHost.setInputMode(inputMode)
@@ -2801,6 +3171,16 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     }
 
     private func enabledEditCommands(in requestedCommands: OuterframeEditCommandSet) -> OuterframeEditCommandSet {
+        if perfMachineUnsupported {
+            var enabledCommands: OuterframeEditCommandSet = []
+            if machineUnsupportedSelectedText() != nil, requestedCommands.contains(.copy) {
+                enabledCommands.insert(.copy)
+            }
+            if requestedCommands.contains(.selectAll), !machineUnsupportedBodyText().isEmpty {
+                enabledCommands.insert(.selectAll)
+            }
+            return enabledCommands
+        }
         if perfPathInputController.isFocused {
             return perfPathInputController.enabledEditCommands(in: requestedCommands)
         }
@@ -3504,7 +3884,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     }
 
     private func styleRecordButton() {
-        let enabled = !isBusy && (isRecording || selectedPID != nil)
+        let enabled = !isBusy && (isRecording || (selectedPID != nil && perfUsable && !perfMachineUnsupported))
         recordToggleButtonLayer.cornerRadius = 7
         recordToggleButtonLayer.borderWidth = 1
         recordToggleButtonLayer.borderColor = NSColor.separatorColor.cgColor
@@ -3531,18 +3911,23 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         return layer
     }
 
-    private func makeSymbolLayer(_ symbolName: String, color: NSColor) -> CALayer {
+    private func makeSymbolLayer(_ symbolName: String, color: NSColor, renderSize: CGFloat = 32) -> CALayer {
         let layer = CALayer()
-        updateSymbolLayer(layer, symbolName: symbolName, color: color)
+        updateSymbolLayer(layer, symbolName: symbolName, color: color, renderSize: renderSize)
         layer.contentsGravity = .resizeAspect
         layer.contentsScale = 2
         return layer
     }
 
-    private func updateSymbolLayer(_ layer: CALayer, symbolName: String, color: NSColor) {
-        guard let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) else { return }
+    private func updateSymbolLayer(_ layer: CALayer,
+                                   symbolName: String,
+                                   color: NSColor,
+                                   renderSize: CGFloat = 32) {
+        guard let baseImage = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil) else { return }
+        let configuration = NSImage.SymbolConfiguration(pointSize: renderSize, weight: .regular)
+        let image = baseImage.withSymbolConfiguration(configuration) ?? baseImage
         image.isTemplate = true
-        let size = NSSize(width: 24, height: 24)
+        let size = NSSize(width: renderSize * 2, height: renderSize * 2)
         let rendered = NSImage(size: size)
         appearance.performAsCurrentDrawingAppearance {
             rendered.lockFocus()

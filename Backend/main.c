@@ -25,6 +25,10 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
+#endif
 
 #define DEFAULT_PORT 7356
 #define READ_BUFFER_SIZE 8192
@@ -53,6 +57,11 @@ static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
 static char g_backend_label[256] = "dev.outergroup.Profile";
 static char g_perf_path[PATH_MAX] = "";
+static bool g_perf_status_checked = false;
+static bool g_perf_status_usable = false;
+static bool g_perf_status_machine_unsupported = false;
+static char g_perf_status_path[PATH_MAX] = "";
+static char g_perf_status_message[1024] = "";
 static volatile sig_atomic_t g_shutdown_requested = 0;
 static volatile sig_atomic_t g_listener_fd = -1;
 static bool g_systemd_socket_activation = false;
@@ -139,6 +148,7 @@ typedef struct {
     char record_log[PATH_MAX];
     char script_text[PATH_MAX];
     char script_err[PATH_MAX];
+    char perf_path[PATH_MAX];
     uint64_t cpu_ticks_before;
     bool have_cpu_ticks_before;
     double start_time;
@@ -879,6 +889,26 @@ static const char *find_perf_binary(void) {
     return "perf";
 }
 
+static const char *find_versioned_perf_binary(void) {
+    static char candidate_path[PATH_MAX];
+    static const char *directories[] = {"/usr/bin", "/bin", "/usr/local/bin", NULL};
+    for (int i = 0; directories[i]; i++) {
+        DIR *dir = opendir(directories[i]);
+        if (!dir) continue;
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strncmp(entry->d_name, "perf_", 5) != 0 && strncmp(entry->d_name, "perf-", 5) != 0) continue;
+            snprintf(candidate_path, sizeof(candidate_path), "%s/%s", directories[i], entry->d_name);
+            if (access(candidate_path, X_OK) == 0) {
+                closedir(dir);
+                return candidate_path;
+            }
+        }
+        closedir(dir);
+    }
+    return NULL;
+}
+
 static void copy_first_nonempty_line(const char *text, char *dst, size_t dst_size) {
     if (!dst || dst_size == 0) return;
     dst[0] = '\0';
@@ -959,6 +989,121 @@ static bool check_perf_available(const char *perf, char *message, size_t message
         }
     }
     return false;
+}
+
+static bool check_perf_kernel_available(char *message, size_t message_size, bool *machine_unsupported) {
+    if (message && message_size > 0) message[0] = '\0';
+    if (machine_unsupported) *machine_unsupported = false;
+#ifndef __linux__
+    if (message && message_size > 0) snprintf(message, message_size, "Linux perf profiling is only available on Linux.\n");
+    if (machine_unsupported) *machine_unsupported = true;
+    return false;
+#elif !defined(__NR_perf_event_open)
+    if (message && message_size > 0) {
+        snprintf(message,
+                 message_size,
+                 "This system does not expose the perf_event_open syscall number. Profile cannot record stack samples on this machine.\n");
+    }
+    if (machine_unsupported) *machine_unsupported = true;
+    return false;
+#else
+    struct perf_event_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.type = PERF_TYPE_SOFTWARE;
+    attr.size = sizeof(attr);
+    attr.config = PERF_COUNT_SW_CPU_CLOCK;
+    attr.disabled = 1;
+    attr.exclude_kernel = 1;
+    attr.exclude_hv = 1;
+
+    int fd = (int)syscall(__NR_perf_event_open, &attr, 0, -1, -1, PERF_FLAG_FD_CLOEXEC);
+    if (fd >= 0) {
+        close(fd);
+        return true;
+    }
+
+    int err = errno;
+    if (message && message_size > 0) {
+        if (err == ENOSYS) {
+            snprintf(message,
+                     message_size,
+                     "This Linux kernel does not implement perf_event_open. It may have been built without CONFIG_PERF_EVENTS, so Profile cannot record stack samples on this machine.\n");
+            if (machine_unsupported) *machine_unsupported = true;
+        } else if (err == EACCES || err == EPERM) {
+            snprintf(message,
+                     message_size,
+                     "The kernel denied perf_event_open: %s. Try running Profile as root or lowering kernel.perf_event_paranoid.\n",
+                     strerror(err));
+        } else if (err == ENOENT || err == EOPNOTSUPP) {
+            snprintf(message,
+                     message_size,
+                     "This Linux kernel does not support the cpu-clock perf event needed by Profile: %s.\n",
+                     strerror(err));
+            if (machine_unsupported) *machine_unsupported = true;
+        } else {
+            snprintf(message,
+                     message_size,
+                     "Profile could not open a test perf event: %s.\n",
+                     strerror(err));
+        }
+    }
+    return false;
+#endif
+}
+
+static bool check_perf_ready(const char *perf, char *message, size_t message_size) {
+    if (message && message_size > 0) message[0] = '\0';
+    if (!check_perf_available(perf, message, message_size)) return false;
+    return check_perf_kernel_available(message, message_size, NULL);
+}
+
+static void refresh_perf_status(void) {
+    const char *perf = find_perf_binary();
+    char message[sizeof(g_perf_status_message)];
+
+    bool machine_unsupported = false;
+    if (!check_perf_kernel_available(message, sizeof(message), &machine_unsupported) && machine_unsupported) {
+        if (g_perf_path[0] == '\0') {
+            const char *versioned_perf = find_versioned_perf_binary();
+            if (versioned_perf) perf = versioned_perf;
+        }
+        snprintf(g_perf_status_path, sizeof(g_perf_status_path), "%s", perf);
+        snprintf(g_perf_status_message, sizeof(g_perf_status_message), "%s", message);
+        g_perf_status_usable = false;
+        g_perf_status_machine_unsupported = true;
+        g_perf_status_checked = true;
+        return;
+    }
+
+    bool perf_usable = check_perf_available(perf, message, sizeof(message));
+    if (!perf_usable && g_perf_path[0] == '\0') {
+        const char *versioned_perf = find_versioned_perf_binary();
+        if (versioned_perf) {
+            char versioned_message[sizeof(g_perf_status_message)];
+            if (check_perf_available(versioned_perf, versioned_message, sizeof(versioned_message))) {
+                perf = versioned_perf;
+                perf_usable = true;
+                snprintf(message, sizeof(message), "%s", versioned_message);
+            }
+        }
+    }
+    bool usable = perf_usable && check_perf_kernel_available(message, sizeof(message), &machine_unsupported);
+    snprintf(g_perf_status_path, sizeof(g_perf_status_path), "%s", perf);
+    snprintf(g_perf_status_message, sizeof(g_perf_status_message), "%s", message);
+    g_perf_status_usable = usable;
+    g_perf_status_machine_unsupported = machine_unsupported;
+    g_perf_status_checked = true;
+}
+
+static bool cached_perf_ready(char *message, size_t message_size) {
+    const char *perf = find_perf_binary();
+    if (!g_perf_status_checked || (g_perf_path[0] != '\0' && strcmp(g_perf_status_path, perf) != 0)) {
+        refresh_perf_status();
+    }
+    if (message && message_size > 0) {
+        snprintf(message, message_size, "%s", g_perf_status_message);
+    }
+    return g_perf_status_usable;
 }
 
 static char *read_whole_file_or_empty(const char *path) {
@@ -1049,10 +1194,10 @@ static bool binary_add_string_n(BinaryStringTable *table, const char *text, size
 }
 
 static void send_perf_config_binary(int fd) {
-    const char *perf = find_perf_binary();
     char check_message[1024];
-    bool usable = check_perf_available(perf, check_message, sizeof(check_message));
-    const uint32_t header_size = 44;
+    bool usable = cached_perf_ready(check_message, sizeof(check_message));
+    const char *perf = g_perf_status_path[0] ? g_perf_status_path : find_perf_binary();
+    const uint32_t header_size = 48;
     BinaryStringTable string_table = {.base_offset = header_size};
     uint32_t path_offset = 0, path_length = 0, message_offset = 0, message_length = 0;
     bool ok = binary_add_string(&string_table, perf, &path_offset, &path_length) &&
@@ -1067,6 +1212,7 @@ static void send_perf_config_binary(int fd) {
          sb_append_u32(&binary, message_length) &&
          sb_append_u32(&binary, header_size) &&
          sb_append_u32(&binary, (uint32_t)string_table.strings.length) &&
+         sb_append_u32(&binary, g_perf_status_machine_unsupported ? 1 : 0) &&
          sb_append_n(&binary, string_table.strings.data, string_table.strings.length);
     free(string_table.strings.data);
     if (!ok) {
@@ -1637,13 +1783,13 @@ static void send_profile_capture(int fd, const char *query) {
     if (frequency < 19) frequency = 19;
     if (frequency > 999) frequency = 999;
 
-    const char *perf = find_perf_binary();
     char perf_error[1024];
-    if (!check_perf_available(perf, perf_error, sizeof(perf_error))) {
+    if (!cached_perf_ready(perf_error, sizeof(perf_error))) {
         log_perf_diagnostic("perf availability check failed", perf_error);
         send_text_response(fd, 500, perf_error[0] ? perf_error : "perf is not installed or is not usable.\n");
         return;
     }
+    const char *perf = g_perf_status_path[0] ? g_perf_status_path : find_perf_binary();
     char temp_template[] = "/tmp/outer-profile-XXXXXX";
     char *temp_dir = mkdtemp(temp_template);
     if (!temp_dir) {
@@ -1770,14 +1916,15 @@ static void send_profile_start(int fd, const char *query) {
     snprintf(recording.script_text, sizeof(recording.script_text), "%s/script.txt", temp_dir);
     snprintf(recording.script_err, sizeof(recording.script_err), "%s/script.err", temp_dir);
 
-    const char *perf = find_perf_binary();
     char perf_error[1024];
-    if (!check_perf_available(perf, perf_error, sizeof(perf_error))) {
+    if (!cached_perf_ready(perf_error, sizeof(perf_error))) {
         log_perf_diagnostic("perf availability check failed", perf_error);
         cleanup_temp_dir(temp_dir);
         send_text_response(fd, 500, perf_error[0] ? perf_error : "perf is not installed or is not usable.\n");
         return;
     }
+    const char *perf = g_perf_status_path[0] ? g_perf_status_path : find_perf_binary();
+    snprintf(recording.perf_path, sizeof(recording.perf_path), "%s", perf);
     char frequency_text[32], pid_text[32];
     snprintf(frequency_text, sizeof(frequency_text), "%d", frequency);
     snprintf(pid_text, sizeof(pid_text), "%d", pid);
@@ -1796,8 +1943,8 @@ static void send_profile_start(int fd, const char *query) {
             dup2(log_fd, STDERR_FILENO);
             if (log_fd > STDERR_FILENO) close(log_fd);
         }
-        execlp(perf,
-               perf,
+        execlp(recording.perf_path,
+               recording.perf_path,
                "record",
                "-e", "cpu-clock",
                "-F", frequency_text,
@@ -1857,7 +2004,7 @@ static void send_profile_stop(int fd) {
     bool have_cpu_ticks_after = read_process_cpu_ticks(recording.pid, &cpu_ticks_after);
     int record_status = stop_recording_child(recording.child_pid);
 
-    const char *perf = find_perf_binary();
+    const char *perf = recording.perf_path[0] ? recording.perf_path : find_perf_binary();
     char command[PATH_MAX * 4];
     snprintf(command, sizeof(command),
              "'%s' script -i '%s' > '%s' 2> '%s'",
@@ -2104,6 +2251,10 @@ int main(int argc, char **argv) {
 
     snprintf(g_bundle_file_path_macos_arm, sizeof(g_bundle_file_path_macos_arm), "%s/%s", bundles_dir, kBundleFilePathMacosArm);
     snprintf(g_bundle_file_path_macos_x86, sizeof(g_bundle_file_path_macos_x86), "%s/%s", bundles_dir, kBundleFilePathMacosX86);
+    refresh_perf_status();
+    if (!g_perf_status_usable) {
+        log_perf_diagnostic("perf startup check failed", g_perf_status_message);
+    }
 
     struct sigaction action;
     memset(&action, 0, sizeof(action));
