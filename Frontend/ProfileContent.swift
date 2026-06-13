@@ -613,9 +613,9 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             commitFlameZoomLayout()
             updateFlameScrollPosition()
 
-        case .mouseDown(let point, _, _):
+        case .mouseDown(let point, _, let clickCount):
             if perfMachineUnsupported {
-                handleMachineUnsupportedMouseDown(at: point)
+                handleMachineUnsupportedMouseDown(at: point, clickCount: clickCount)
                 return
             }
             handleMouseDown(at: point)
@@ -2116,12 +2116,8 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         title.frame = CGRect(x: 68, y: panelHeight - 56, width: max(panelWidth - 92, 1), height: 24)
         panel.addSublayer(title)
 
-        let message = perfMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-        let bodyText = message.isEmpty
-            ? "This machine does not support the Linux perf events that Profile needs to record stack samples."
-            : message
         let bodyFrame = CGRect(x: 24, y: 28, width: max(panelWidth - 48, 1), height: panelHeight - 104)
-        renderMachineUnsupportedSelectableText(bodyText, in: bodyFrame, on: panel)
+        renderMachineUnsupportedSelectableText(machineUnsupportedBodyText(), in: bodyFrame, on: panel)
 
         CATransaction.commit()
     }
@@ -2252,15 +2248,79 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                    line.range.lowerBound + characterIndex(forUTF16: utf16Index, in: line.text))
     }
 
-    private func handleMachineUnsupportedMouseDown(at point: CGPoint) {
+    private func handleMachineUnsupportedMouseDown(at point: CGPoint, clickCount: Int) {
         guard let index = machineUnsupportedCharacterIndex(at: point) else {
             clearMachineUnsupportedSelection()
             return
         }
-        machineUnsupportedSelectionAnchor = index
-        machineUnsupportedSelectionFocus = index
-        isSelectingMachineUnsupportedText = true
+        if clickCount >= 3 {
+            let range = machineUnsupportedParagraphRange(containing: index)
+            machineUnsupportedSelectionAnchor = range.lowerBound
+            machineUnsupportedSelectionFocus = range.upperBound
+            isSelectingMachineUnsupportedText = false
+        } else if clickCount == 2 {
+            let range = machineUnsupportedWordRange(containing: index)
+            machineUnsupportedSelectionAnchor = range.lowerBound
+            machineUnsupportedSelectionFocus = range.upperBound
+            isSelectingMachineUnsupportedText = false
+        } else {
+            machineUnsupportedSelectionAnchor = index
+            machineUnsupportedSelectionFocus = index
+            isSelectingMachineUnsupportedText = true
+        }
         renderMachineUnsupportedOverlay()
+    }
+
+    private func machineUnsupportedWordRange(containing index: Int) -> Range<Int> {
+        let text = machineUnsupportedBodyText()
+        guard !text.isEmpty else { return 0..<0 }
+        let characters = Array(text)
+        var location = min(max(index, 0), characters.count - 1)
+        if location > 0, !isMachineUnsupportedWordCharacter(characters[location]) {
+            location -= 1
+        }
+        guard isMachineUnsupportedWordCharacter(characters[location]) else {
+            let clamped = min(max(index, 0), characters.count)
+            return clamped..<clamped
+        }
+
+        var start = location
+        while start > 0, isMachineUnsupportedWordCharacter(characters[start - 1]) {
+            start -= 1
+        }
+        var end = location + 1
+        while end < characters.count, isMachineUnsupportedWordCharacter(characters[end]) {
+            end += 1
+        }
+        return start..<end
+    }
+
+    private func machineUnsupportedParagraphRange(containing index: Int) -> Range<Int> {
+        let text = machineUnsupportedBodyText()
+        guard !text.isEmpty else { return 0..<0 }
+        let characters = Array(text)
+        var location = min(max(index, 0), characters.count - 1)
+        if location > 0, characters[location] == "\n" {
+            location -= 1
+        }
+
+        var start = location
+        while start > 0, characters[start - 1] != "\n" {
+            start -= 1
+        }
+        var end = location
+        while end < characters.count, characters[end] != "\n" {
+            end += 1
+        }
+        return start..<end
+    }
+
+    private func isMachineUnsupportedWordCharacter(_ character: Character) -> Bool {
+        guard let scalar = character.unicodeScalars.first, character.unicodeScalars.count == 1 else {
+            return false
+        }
+        if CharacterSet.alphanumerics.contains(scalar) { return true }
+        return "_-./~:".unicodeScalars.contains(scalar)
     }
 
     private func handleMachineUnsupportedMouseDragged(at point: CGPoint) {
