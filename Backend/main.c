@@ -55,7 +55,7 @@ static const char *kBundleFilePathMacosX86 = "ProfileContent.bundle.macos-x86.aa
 
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
-static char g_backend_label[256] = "dev.outergroup.Profile";
+static char g_backend_label[256] = "org.outershell.Profile";
 static char g_perf_path[PATH_MAX] = "";
 static bool g_perf_status_checked = false;
 static bool g_perf_status_usable = false;

@@ -50,4 +50,4 @@ echo "  ${BUILD_ROOT}/${CONFIGURATION}/ProfileBackend"
 echo "  ${RUN_ROOT}/bundles"
 echo
 echo "Run:"
-echo "  \"${BUILD_ROOT}/${CONFIGURATION}/ProfileBackend\" --label dev.outergroup.Profile --bundles-dir \"${RUN_ROOT}/bundles\" --icon-file \"${SCRIPT_DIR}/app-icon.png\""
+echo "  \"${BUILD_ROOT}/${CONFIGURATION}/ProfileBackend\" --label org.outershell.Profile --bundles-dir \"${RUN_ROOT}/bundles\" --icon-file \"${SCRIPT_DIR}/app-icon.png\""

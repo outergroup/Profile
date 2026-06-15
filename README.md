@@ -25,7 +25,7 @@ For Outer Loop-managed deployments, prefer a Unix socket. If `--port` is omitted
 
 ```bash
 ./build/macos/Release/ProfileBackend \
-  --label dev.outergroup.Profile \
+  --label org.outershell.Profile \
   --bundles-dir ./build/run/bundles
 ```
 
@@ -33,8 +33,8 @@ You can also pass an explicit socket:
 
 ```bash
 ./build/macos/Release/ProfileBackend \
-  --socket-path "$XDG_RUNTIME_DIR/dev.outergroup.Profile" \
-  --label dev.outergroup.Profile \
+  --socket-path "$XDG_RUNTIME_DIR/org.outershell.Profile" \
+  --label org.outershell.Profile \
   --bundles-dir ./build/run/bundles
 ```
 
@@ -59,5 +59,5 @@ workspace.
 To test a deployed remote host with curl:
 
 ```bash
-ssh "$HOST" 'curl --unix-socket "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/dev.outergroup.Profile" http://localhost/'
+ssh "$HOST" 'curl --unix-socket "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/org.outershell.Profile" http://localhost/'
 ```
