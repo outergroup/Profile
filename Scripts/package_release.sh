@@ -44,17 +44,25 @@ echo "==> Archiving ProfileContent bundles"
 STAGING_ROOT="$(mktemp -d)"
 trap 'rm -rf "${STAGING_ROOT}"' EXIT
 
-APP_ROOT="${STAGING_ROOT}/Profile"
-mkdir -p \
-    "${APP_ROOT}/RemoteLinuxBinaries/aarch64" \
-    "${APP_ROOT}/RemoteLinuxBinaries/x86_64" \
-    "${APP_ROOT}/bundles"
+OUTPUT_APP_ROOT="${OUTPUT_ROOT}/Profile"
+rm -rf "${OUTPUT_APP_ROOT}"
+mkdir -p "${OUTPUT_APP_ROOT}"
 
-install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/ProfileBackend" "${APP_ROOT}/RemoteLinuxBinaries/aarch64/ProfileBackend"
-install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/ProfileBackend" "${APP_ROOT}/RemoteLinuxBinaries/x86_64/ProfileBackend"
-install -m 0644 "${PACKAGE_ROOT}/bundles/ProfileContent.bundle.macos-arm.aar" "${APP_ROOT}/bundles/ProfileContent.bundle.macos-arm.aar"
-install -m 0644 "${PACKAGE_ROOT}/bundles/ProfileContent.bundle.macos-x86.aar" "${APP_ROOT}/bundles/ProfileContent.bundle.macos-x86.aar"
-install -m 0644 "${REPO_ROOT}/app-icon.png" "${APP_ROOT}/app-icon.png"
+package_linux_variant() {
+    local arch="$1"
+    local output_name="$2"
+    local app_root="${STAGING_ROOT}/Profile"
+    rm -rf "${app_root}"
+    mkdir -p \
+        "${app_root}/RemoteLinuxBinaries/${arch}" \
+        "${app_root}/bundles"
+    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/ProfileBackend" "${app_root}/RemoteLinuxBinaries/${arch}/ProfileBackend"
+    install -m 0644 "${PACKAGE_ROOT}/bundles/ProfileContent.bundle.macos-arm.aar" "${app_root}/bundles/ProfileContent.bundle.macos-arm.aar"
+    install -m 0644 "${PACKAGE_ROOT}/bundles/ProfileContent.bundle.macos-x86.aar" "${app_root}/bundles/ProfileContent.bundle.macos-x86.aar"
+    install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_root}/app-icon.png"
+    tar --format ustar --no-xattrs -C "${STAGING_ROOT}" -czf "${OUTPUT_APP_ROOT}/${output_name}.tar.gz" Profile
+    echo "Packaged ${OUTPUT_APP_ROOT}/${output_name}.tar.gz"
+}
 
-tar --format ustar --no-xattrs -C "${STAGING_ROOT}" -czf "${OUTPUT_ROOT}/Profile.tar.gz" Profile
-echo "Packaged ${OUTPUT_ROOT}/Profile.tar.gz"
+package_linux_variant aarch64 linux-aarch64
+package_linux_variant x86_64 linux-x86_64
