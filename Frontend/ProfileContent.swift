@@ -13,6 +13,19 @@ import QuartzCore
     }
 }
 
+@MainActor
+private final class FilePickerScrollbarDelegate: ScrollbarControllerDelegate {
+    private weak var owner: ProfileHandler?
+
+    init(owner: ProfileHandler) {
+        self.owner = owner
+    }
+
+    func scrollbarDidChangeScrollOffset(_ offset: CGFloat) {
+        owner?.setFilePickerScroll(offset)
+    }
+}
+
 private struct ProcessListResponse {
     let processes: [ProfileProcess]
 }
@@ -432,6 +445,9 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     private let processContentLayer = CALayer()
     private let processScrollbarLayer = CALayer()
     private let filePickerOverlayLayer = CALayer()
+    private let filePickerListLayer = CALayer()
+    private let filePickerRowsContentLayer = CALayer()
+    private let filePickerStatusLayer = CALayer()
     private let traceViewportLayer = CALayer()
     private let traceContentLayer = CALayer()
     private let traceScrollbarLayer = CALayer()
@@ -481,9 +497,17 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     private var pendingFilePicker: FilePickerResponse?
     private var filePickerPanelFrame = CGRect.zero
     private var filePickerListFrame = CGRect.zero
+    private var filePickerBreadcrumbFrame = CGRect.zero
     private var filePickerCancelFrame = CGRect.zero
-    private var filePickerEntryFrames: [(frame: CGRect, entry: FilePickerEntry)] = []
+    private var filePickerEntryFrames: [(frame: CGRect, entry: FilePickerEntry, index: Int)] = []
+    private var filePickerBreadcrumbSegmentFrames: [(frame: CGRect, path: String)] = []
+    private var filePickerVisibleRowLayers: [Int: CALayer] = [:]
+    private var filePickerReusableRowLayers: [CALayer] = []
+    private var filePickerSelectedIndex: Int?
+    private var filePickerTypeaheadPrefix = ""
+    private var filePickerTypeaheadLastUpdated: Date?
     private var filePickerScroll: CGFloat = 0
+    private var filePickerContentHeight: CGFloat = 0
     private var filteredProcessIndices: [Int] = []
     private var machineUnsupportedPanelFrame = CGRect.zero
     private var machineUnsupportedTextLines: [MachineUnsupportedTextLine] = []
@@ -514,11 +538,14 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     private var processSearchContextMenuIDs: Set<UUID> = []
     private var perfPathContextMenuIDs: Set<UUID> = []
     private var currentCursor: PluginCursorType = .arrow
+    private lazy var filePickerScrollbarDelegate = FilePickerScrollbarDelegate(owner: self)
+    private var filePickerScrollbarController: ScrollbarController<FilePickerScrollbarDelegate>?
 
     private let toolbarHeight: CGFloat = 52
     private let sidebarWidth: CGFloat = 240
     private let timelineHeight: CGFloat = 132
     private let rowHeight: CGFloat = 30
+    private let filePickerRowHeight: CGFloat = 28
     private let runRowHeight: CGFloat = 56
     private let horizontalInset: CGFloat = 14
     private static let processSearchFieldID = UUID()
@@ -581,9 +608,9 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             guard !perfMachineUnsupported else { return }
             let multiplier: CGFloat = hasPreciseScrollingDeltas ? 1 : rowHeight
             if pendingFilePicker != nil {
-                filePickerScroll -= delta.y * multiplier
-                clampFilePickerScroll()
-                renderFilePicker()
+                if filePickerListFrame.contains(point) {
+                    setFilePickerScroll(filePickerScroll - delta.y * multiplier)
+                }
             } else if showingSetup, processListLayer.frame.contains(point) {
                 processScroll -= delta.y * multiplier
                 clampProcessScroll()
@@ -618,7 +645,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                 handleMachineUnsupportedMouseDown(at: point, clickCount: clickCount)
                 return
             }
-            handleMouseDown(at: point)
+            handleMouseDown(at: point, clickCount: clickCount)
 
         case .mouseDragged(let point, _):
             if perfMachineUnsupported {
@@ -827,6 +854,14 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         tooltipTextLayer.truncationMode = .end
         tooltipTextLayer.isWrapped = true
         filePickerOverlayLayer.isHidden = true
+        let filePickerScrollbar = ScrollbarController<FilePickerScrollbarDelegate>(appConnection: outerframeHost,
+                                                                                  viewportLayer: filePickerListLayer,
+                                                                                  appearance: appearance,
+                                                                                  width: 10,
+                                                                                  inset: 4,
+                                                                                  scrollOffsetOrigin: .bottom)
+        filePickerScrollbar.delegate = filePickerScrollbarDelegate
+        filePickerScrollbarController = filePickerScrollbar
         machineUnsupportedOverlayLayer.isHidden = true
     }
 
@@ -850,6 +885,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             processSearchSelectionLayer.backgroundColor = NSColor.selectedTextBackgroundColor.withAlphaComponent(isDarkMode ? 0.58 : 0.42).cgColor
             processSearchCursorLayer.backgroundColor = NSColor.labelColor.cgColor
             updateSymbolLayer(processSearchIconLayer, symbolName: "magnifyingglass", color: NSColor.secondaryLabelColor)
+            filePickerScrollbarController?.updateAppearance(appearance)
             timelineLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
             flameLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
             statusLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
@@ -910,9 +946,9 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         renderMachineUnsupportedOverlay()
     }
 
-    private func handleMouseDown(at point: CGPoint) {
+    private func handleMouseDown(at point: CGPoint, clickCount: Int) {
         if pendingFilePicker != nil {
-            handleFilePickerMouseDown(at: point)
+            handleFilePickerMouseDown(at: point, clickCount: clickCount)
             return
         }
 
@@ -1088,6 +1124,10 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     }
 
     private func handleMouseDragged(at point: CGPoint) {
+        if pendingFilePicker != nil,
+           filePickerScrollbarController?.handleMouseDragged(to: rootLayer.convert(point, to: filePickerListLayer)) == true {
+            return
+        }
         guard rangeDragStart != nil, lastProfile != nil, !showingSetup else { return }
         let timelinePoint = timelineLayer.convert(point, from: rootLayer)
         guard let time = timeForTimelinePoint(timelinePoint) else { return }
@@ -1095,6 +1135,9 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     }
 
     private func handleMouseUp(at point: CGPoint) {
+        if pendingFilePicker != nil {
+            _ = filePickerScrollbarController?.handleMouseUp(at: rootLayer.convert(point, to: filePickerListLayer))
+        }
         guard let dragStart = rangeDragStart, let profile = lastProfile, !showingSetup else { return }
         defer { rangeDragStart = nil }
         let timelinePoint = timelineLayer.convert(point, from: rootLayer)
@@ -1133,7 +1176,11 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     private func updateCursor(at point: CGPoint) {
         if pendingFilePicker != nil {
             if filePickerCancelFrame.contains(point) ||
-                filePickerEntryFrames.contains(where: { $0.frame.contains(point) }) {
+                FilePickerBreadcrumbBar.hitPath(at: point,
+                                                breadcrumbFrame: filePickerBreadcrumbFrame,
+                                                segmentFrames: filePickerBreadcrumbSegmentFrames) != nil ||
+                (filePickerListFrame.contains(point) &&
+                 filePickerEntryFrames.contains(where: { $0.frame.contains(point) })) {
                 setCursorIfNeeded(.pointingHand)
             } else {
                 setCursorIfNeeded(.arrow)
@@ -1167,10 +1214,16 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                                charactersIgnoringModifiers: String,
                                modifierFlags: NSEvent.ModifierFlags,
                                isARepeat: Bool) {
-        _ = characters
         _ = charactersIgnoringModifiers
-        _ = modifierFlags
         _ = isARepeat
+        if pendingFilePicker != nil,
+           !processSearchFocused,
+           !perfPathInputController.isFocused {
+            handleFilePickerKeyDown(keyCode: keyCode,
+                                    characters: characters,
+                                    modifierFlags: modifierFlags)
+            return
+        }
         guard processSearchFocused || perfPathInputController.isFocused else { return }
         if modifierFlags.contains(.command) {
             switch charactersIgnoringModifiers.lowercased() {
@@ -1202,6 +1255,41 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                 blurPerfPath(commit: true)
             }
         }
+    }
+
+    private func handleFilePickerKeyDown(keyCode: UInt16,
+                                         characters: String,
+                                         modifierFlags: NSEvent.ModifierFlags) {
+        if modifierFlags.contains(.command) || modifierFlags.contains(.control) || modifierFlags.contains(.option) {
+            return
+        }
+        switch keyCode {
+        case 126:
+            moveFilePickerSelection(delta: -1)
+        case 125:
+            moveFilePickerSelection(delta: 1)
+        case 36, 76:
+            activateSelectedFilePickerEntry()
+        case 53:
+            pendingFilePicker = nil
+            resetFilePickerTypeahead()
+            renderFilePicker()
+        default:
+            if let text = filePickerTypeaheadText(from: characters) {
+                handleFilePickerTypeahead(text)
+            }
+        }
+    }
+
+    private func filePickerTypeaheadText(from characters: String) -> String? {
+        guard !characters.isEmpty,
+              characters.unicodeScalars.allSatisfy({
+                  !CharacterSet.controlCharacters.contains($0) &&
+                  !CharacterSet.newlines.contains($0)
+              }) else {
+            return nil
+        }
+        return characters
     }
 
     private func handleTextInput(_ text: String,
@@ -1519,8 +1607,11 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         } else {
             initialPath = "/"
         }
+        blurPerfPath(commit: false)
         pendingFilePicker = FilePickerResponse(path: initialPath, parent: "/", entries: [])
         filePickerScroll = 0
+        filePickerSelectedIndex = nil
+        resetFilePickerTypeahead()
         fetchFilePicker(path: initialPath)
         renderFilePicker()
     }
@@ -1537,6 +1628,8 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                 if let result {
                     self.pendingFilePicker = result
                     self.filePickerScroll = 0
+                    self.filePickerSelectedIndex = nil
+                    self.resetFilePickerTypeahead()
                 } else {
                     self.statusLayer.string = error?.localizedDescription ?? "Could not load directory."
                 }
@@ -2406,120 +2499,380 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     }
 
     private func renderFilePicker() {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        filePickerOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
-        filePickerEntryFrames.removeAll()
-        guard let picker = pendingFilePicker else {
-            filePickerOverlayLayer.isHidden = true
-            filePickerPanelFrame = .zero
-            filePickerListFrame = .zero
-            filePickerCancelFrame = .zero
-            CATransaction.commit()
-            return
+        appearance.performAsCurrentDrawingAppearance {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            defer { CATransaction.commit() }
+
+            filePickerOverlayLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+            filePickerEntryFrames.removeAll()
+            filePickerBreadcrumbSegmentFrames.removeAll()
+            guard let picker = pendingFilePicker else {
+                filePickerOverlayLayer.isHidden = true
+                filePickerPanelFrame = .zero
+                filePickerListFrame = .zero
+                filePickerBreadcrumbFrame = .zero
+                filePickerCancelFrame = .zero
+                filePickerSelectedIndex = nil
+                filePickerContentHeight = 0
+                resetFilePickerTypeahead()
+                resetFilePickerRowLayers()
+                updateFilePickerScrollbarLayout()
+                return
+            }
+            clampFilePickerSelection()
+
+            filePickerOverlayLayer.isHidden = false
+            filePickerOverlayLayer.frame = rootLayer.bounds
+            filePickerOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.18))
+
+            let panelWidth = min(max(rootLayer.bounds.width - 56, 480), 760)
+            let panelHeight = min(max(rootLayer.bounds.height - 80, 340), 540)
+            let panel = CALayer()
+            filePickerPanelFrame = CGRect(x: floor((rootLayer.bounds.width - panelWidth) / 2),
+                                          y: floor((rootLayer.bounds.height - panelHeight) / 2),
+                                          width: panelWidth,
+                                          height: panelHeight)
+            panel.frame = filePickerPanelFrame
+            panel.cornerRadius = 8
+            panel.borderWidth = 1
+            panel.backgroundColor = resolvedCGColor(NSColor.windowBackgroundColor)
+            panel.borderColor = resolvedCGColor(NSColor.separatorColor)
+            filePickerOverlayLayer.addSublayer(panel)
+
+            let title = makeTextLayer(size: 15, weight: .semibold)
+            title.string = "Choose perf"
+            title.frame = CGRect(x: 18, y: panelHeight - 38, width: panelWidth - 36, height: 20)
+            panel.addSublayer(title)
+
+            let breadcrumbFrame = CGRect(x: 18, y: panelHeight - 78, width: panelWidth - 36, height: FilePickerBreadcrumbBar.height)
+            filePickerBreadcrumbFrame = breadcrumbFrame.offsetBy(dx: filePickerPanelFrame.minX, dy: filePickerPanelFrame.minY)
+            let breadcrumb = CALayer()
+            breadcrumb.frame = breadcrumbFrame
+            breadcrumb.masksToBounds = true
+            FilePickerBreadcrumbBar.render(path: picker.path,
+                                           in: breadcrumb,
+                                           segmentFrames: &filePickerBreadcrumbSegmentFrames,
+                                           appearance: appearance)
+            panel.addSublayer(breadcrumb)
+
+            let bottomControlsHeight: CGFloat = 72
+            let listFrame = CGRect(x: 18, y: bottomControlsHeight, width: panelWidth - 36, height: max(breadcrumbFrame.minY - bottomControlsHeight - 10, 80))
+            filePickerListFrame = listFrame.offsetBy(dx: filePickerPanelFrame.minX, dy: filePickerPanelFrame.minY)
+            filePickerListLayer.frame = listFrame
+            filePickerListLayer.cornerRadius = 6
+            filePickerListLayer.borderWidth = 1
+            filePickerListLayer.borderColor = resolvedCGColor(NSColor.separatorColor)
+            filePickerListLayer.backgroundColor = resolvedCGColor(tableBackgroundColor)
+            filePickerListLayer.masksToBounds = true
+            panel.addSublayer(filePickerListLayer)
+
+            if filePickerRowsContentLayer.superlayer !== filePickerListLayer {
+                filePickerListLayer.addSublayer(filePickerRowsContentLayer)
+            }
+            if filePickerStatusLayer.superlayer !== filePickerListLayer {
+                filePickerListLayer.addSublayer(filePickerStatusLayer)
+            }
+            filePickerStatusLayer.frame = filePickerListLayer.bounds
+            filePickerStatusLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+            updateFilePickerVisibleRows(rebuild: true)
+
+            let cancel = makeButtonLayer(title: "Cancel")
+            cancel.frame = CGRect(x: panelWidth - 18 - 72, y: 20, width: 72, height: 30)
+            cancel.sublayers?.first?.frame = cancel.bounds.insetBy(dx: 10, dy: 6)
+            filePickerCancelFrame = cancel.frame.offsetBy(dx: filePickerPanelFrame.minX, dy: filePickerPanelFrame.minY)
+            panel.addSublayer(cancel)
+            updateFilePickerScrollbarLayout()
         }
-
-        filePickerOverlayLayer.isHidden = false
-        filePickerOverlayLayer.frame = rootLayer.bounds
-        filePickerOverlayLayer.backgroundColor = resolvedCGColor(NSColor.black.withAlphaComponent(0.18))
-
-        let panelWidth = min(max(rootLayer.bounds.width - 56, 480), 760)
-        let panelHeight = min(max(rootLayer.bounds.height - 80, 340), 540)
-        let panel = CALayer()
-        filePickerPanelFrame = CGRect(x: floor((rootLayer.bounds.width - panelWidth) / 2),
-                                      y: floor((rootLayer.bounds.height - panelHeight) / 2),
-                                      width: panelWidth,
-                                      height: panelHeight)
-        panel.frame = filePickerPanelFrame
-        panel.cornerRadius = 8
-        panel.borderWidth = 1
-        panel.backgroundColor = resolvedCGColor(NSColor.windowBackgroundColor)
-        panel.borderColor = resolvedCGColor(NSColor.separatorColor)
-        filePickerOverlayLayer.addSublayer(panel)
-
-        let title = makeTextLayer(size: 15, weight: .semibold)
-        title.string = "Choose perf"
-        title.frame = CGRect(x: 18, y: panelHeight - 38, width: panelWidth - 36, height: 20)
-        panel.addSublayer(title)
-
-        let path = makeTextLayer(size: 12, weight: .regular)
-        path.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        path.foregroundColor = resolvedCGColor(NSColor.secondaryLabelColor)
-        path.string = picker.path
-        path.frame = CGRect(x: 18, y: panelHeight - 62, width: panelWidth - 36, height: 17)
-        panel.addSublayer(path)
-
-        let listFrame = CGRect(x: 18, y: 62, width: panelWidth - 36, height: max(panelHeight - 144, 80))
-        filePickerListFrame = listFrame.offsetBy(dx: filePickerPanelFrame.minX, dy: filePickerPanelFrame.minY)
-        let list = CALayer()
-        list.frame = listFrame
-        list.cornerRadius = 6
-        list.borderWidth = 1
-        list.borderColor = resolvedCGColor(NSColor.separatorColor)
-        list.backgroundColor = resolvedCGColor(tableBackgroundColor)
-        list.masksToBounds = true
-        panel.addSublayer(list)
-
-        let rowHeight: CGFloat = 28
-        let entries = [FilePickerEntry(name: "..", path: picker.parent, isDirectory: true)] + picker.entries
-        let contentHeight = max(CGFloat(entries.count) * rowHeight, listFrame.height)
-        clampFilePickerScroll(contentHeight: contentHeight, viewportHeight: listFrame.height)
-        let visibleStart = max(Int(floor(filePickerScroll / rowHeight)), 0)
-        let visibleEnd = min(entries.count, visibleStart + Int(ceil(listFrame.height / rowHeight)) + 2)
-        for index in visibleStart..<visibleEnd {
-            let entry = entries[index]
-            let y = listFrame.height - CGFloat(index + 1) * rowHeight + filePickerScroll
-            renderFilePickerRow(entry, in: list, localFrame: CGRect(x: 0, y: y, width: listFrame.width, height: rowHeight), listFrame: listFrame)
-        }
-
-        let cancel = makeButtonLayer(title: "Cancel")
-        cancel.frame = CGRect(x: panelWidth - 18 - 72, y: 20, width: 72, height: 30)
-        cancel.sublayers?.first?.frame = cancel.bounds.insetBy(dx: 10, dy: 6)
-        filePickerCancelFrame = cancel.frame.offsetBy(dx: filePickerPanelFrame.minX, dy: filePickerPanelFrame.minY)
-        panel.addSublayer(cancel)
-        CATransaction.commit()
     }
 
-    private func renderFilePickerRow(_ entry: FilePickerEntry, in list: CALayer, localFrame: CGRect, listFrame: CGRect) {
-        filePickerEntryFrames.append((localFrame.offsetBy(dx: filePickerPanelFrame.minX + listFrame.minX,
-                                                          dy: filePickerPanelFrame.minY + listFrame.minY),
-                                      entry))
+    private func makeFilePickerRowLayer() -> CALayer {
         let row = CALayer()
-        row.frame = localFrame
-        list.addSublayer(row)
 
-        let icon = makeSymbolLayer(entry.isDirectory ? "folder" : "terminal", color: entry.isDirectory ? NSColor.controlAccentColor : NSColor.secondaryLabelColor)
-        icon.frame = CGRect(x: 18, y: 6, width: 16, height: 16)
+        let icon = CALayer()
+        icon.contentsGravity = .resizeAspect
+        icon.contentsScale = 2
         row.addSublayer(icon)
 
         let name = makeTextLayer(size: 12, weight: .regular)
-        name.string = entry.name
-        name.foregroundColor = resolvedCGColor(NSColor.labelColor)
-        name.frame = CGRect(x: 48, y: 6, width: max(localFrame.width - 58, 1), height: 16)
         row.addSublayer(name)
+        return row
     }
 
-    private func handleFilePickerMouseDown(at point: CGPoint) {
+    private func configureFilePickerRowLayer(_ row: CALayer,
+                                             entry: FilePickerEntry,
+                                             index: Int,
+                                             frame: CGRect) {
+        row.frame = frame
+        let isSelected = filePickerSelectedIndex == index
+        row.backgroundColor = isSelected ? resolvedCGColor(NSColor.selectedContentBackgroundColor) : nil
+
+        if row.sublayers?.count != 2 {
+            row.sublayers?.forEach { $0.removeFromSuperlayer() }
+            let icon = CALayer()
+            icon.contentsGravity = .resizeAspect
+            icon.contentsScale = 2
+            row.addSublayer(icon)
+            row.addSublayer(makeTextLayer(size: 12, weight: .regular))
+        }
+
+        if let icon = row.sublayers?[0] {
+            icon.frame = CGRect(x: 18, y: 6, width: 16, height: 16)
+            updateSymbolLayer(icon,
+                              symbolName: entry.isDirectory ? "folder" : "terminal",
+                              color: isSelected ? .white : (entry.isDirectory ? NSColor.controlAccentColor : NSColor.secondaryLabelColor),
+                              renderSize: 15)
+        }
+
+        if let name = row.sublayers?[1] as? CATextLayer {
+            name.string = entry.name
+            name.foregroundColor = resolvedCGColor(isSelected ? .white : NSColor.labelColor)
+            name.frame = CGRect(x: 48, y: 6, width: max(frame.width - 58, 1), height: 16)
+        }
+    }
+
+    private func recycleFilePickerRowLayer(_ layer: CALayer) {
+        layer.removeFromSuperlayer()
+        filePickerReusableRowLayers.append(layer)
+    }
+
+    private func resetFilePickerRowLayers() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        filePickerRowsContentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+        filePickerVisibleRowLayers.removeAll()
+        filePickerReusableRowLayers.removeAll()
+        filePickerEntryFrames.removeAll()
+        filePickerRowsContentLayer.frame = CGRect(origin: .zero,
+                                                  size: CGSize(width: filePickerListLayer.bounds.width,
+                                                               height: 0))
+        CATransaction.commit()
+    }
+
+    fileprivate func setFilePickerScroll(_ value: CGFloat) {
+        let maxPickerScroll = max(filePickerContentHeight - filePickerListFrame.height, 0)
+        let clamped = min(max(value, 0), maxPickerScroll)
+        guard abs(clamped - filePickerScroll) > 0.001 else {
+            updateFilePickerScrollbarLayout()
+            return
+        }
+        filePickerScroll = clamped
+        updateFilePickerVisibleRows(rebuild: false)
+    }
+
+    private func updateFilePickerVisibleRows(rebuild: Bool) {
+        guard pendingFilePicker != nil else {
+            resetFilePickerRowLayers()
+            return
+        }
+
+        let entries = pendingFilePicker?.entries ?? []
+        let viewportHeight = max(filePickerListLayer.bounds.height, 0)
+        let viewportWidth = max(filePickerListLayer.bounds.width, 1)
+        filePickerContentHeight = CGFloat(entries.count) * filePickerRowHeight
+        let maxPickerScroll = max(filePickerContentHeight - viewportHeight, 0)
+        filePickerScroll = min(max(filePickerScroll, 0), maxPickerScroll)
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        filePickerEntryFrames.removeAll()
+
+        let contentY = viewportHeight - filePickerContentHeight + filePickerScroll
+        filePickerRowsContentLayer.frame = CGRect(x: 0,
+                                                  y: contentY,
+                                                  width: viewportWidth,
+                                                  height: max(filePickerContentHeight, 0))
+
+        guard !entries.isEmpty, viewportHeight > 0 else {
+            filePickerRowsContentLayer.sublayers?.forEach { $0.removeFromSuperlayer() }
+            filePickerVisibleRowLayers.removeAll()
+            filePickerReusableRowLayers.removeAll()
+            filePickerEntryFrames.removeAll()
+            filePickerRowsContentLayer.frame = CGRect(origin: .zero,
+                                                      size: CGSize(width: viewportWidth, height: 0))
+            CATransaction.commit()
+            updateFilePickerScrollbarLayout()
+            return
+        }
+
+        let visibleStart = max(Int(floor(filePickerScroll / filePickerRowHeight)), 0)
+        let visibleEnd = min(entries.count, visibleStart + Int(ceil(viewportHeight / filePickerRowHeight)) + 2)
+        let visibleRange = visibleStart..<visibleEnd
+
+        let staleIndices = filePickerVisibleRowLayers.keys.filter { !visibleRange.contains($0) }
+        for index in staleIndices {
+            if let layer = filePickerVisibleRowLayers[index] {
+                recycleFilePickerRowLayer(layer)
+            }
+            filePickerVisibleRowLayers.removeValue(forKey: index)
+        }
+
+        for index in visibleRange {
+            let entry = entries[index]
+            let rowFrame = CGRect(x: 0,
+                                  y: filePickerContentHeight - CGFloat(index + 1) * filePickerRowHeight,
+                                  width: viewportWidth,
+                                  height: filePickerRowHeight)
+            let row: CALayer
+            if let existing = filePickerVisibleRowLayers[index] {
+                row = existing
+            } else if let reusable = filePickerReusableRowLayers.popLast() {
+                row = reusable
+                filePickerRowsContentLayer.addSublayer(row)
+                filePickerVisibleRowLayers[index] = row
+            } else {
+                row = makeFilePickerRowLayer()
+                filePickerRowsContentLayer.addSublayer(row)
+                filePickerVisibleRowLayers[index] = row
+            }
+            configureFilePickerRowLayer(row, entry: entry, index: index, frame: rowFrame)
+
+            let visibleFrame = rowFrame.offsetBy(dx: filePickerRowsContentLayer.frame.minX,
+                                                 dy: filePickerRowsContentLayer.frame.minY)
+            filePickerEntryFrames.append((visibleFrame.offsetBy(dx: filePickerListFrame.minX,
+                                                                dy: filePickerListFrame.minY),
+                                          entry,
+                                          index))
+        }
+
+        CATransaction.commit()
+        updateFilePickerScrollbarLayout()
+    }
+
+    private func filePickerScrollbarMetrics() -> ScrollbarController<FilePickerScrollbarDelegate>.Metrics {
+        ScrollbarController.Metrics(viewportSize: filePickerListLayer.bounds.size,
+                                    contentHeight: filePickerContentHeight,
+                                    scrollOffset: filePickerScroll)
+    }
+
+    private func updateFilePickerScrollbarLayout() {
+        filePickerScrollbarController?.updateLayout(metrics: filePickerScrollbarMetrics())
+    }
+
+    private func handleFilePickerMouseDown(at point: CGPoint, clickCount: Int) {
         if filePickerCancelFrame.contains(point) || !filePickerPanelFrame.contains(point) {
             pendingFilePicker = nil
             renderFilePicker()
             return
         }
+        if let path = FilePickerBreadcrumbBar.hitPath(at: point,
+                                                      breadcrumbFrame: filePickerBreadcrumbFrame,
+                                                      segmentFrames: filePickerBreadcrumbSegmentFrames) {
+            fetchFilePicker(path: path)
+            return
+        }
+        if filePickerListFrame.contains(point),
+           filePickerScrollbarController?.handleMouseDown(at: rootLayer.convert(point, to: filePickerListLayer)) == true {
+            return
+        }
         guard filePickerListFrame.contains(point) else { return }
         if let hit = filePickerEntryFrames.first(where: { $0.frame.contains(point) }) {
-            if hit.entry.isDirectory {
-                fetchFilePicker(path: hit.entry.path)
-            } else {
-                pendingFilePicker = nil
-                renderFilePicker()
-                perfPathInputController.setText(hit.entry.path)
-                setPerfPath(hit.entry.path)
+            filePickerSelectedIndex = hit.index
+            resetFilePickerTypeahead()
+            updateFilePickerVisibleRows(rebuild: true)
+            if clickCount >= 2 {
+                activateFilePickerEntry(hit.entry)
             }
+            return
         }
     }
 
+    private func activateSelectedFilePickerEntry() {
+        guard let selectedIndex = filePickerSelectedIndex,
+              let entries = pendingFilePicker?.entries,
+              entries.indices.contains(selectedIndex) else {
+            return
+        }
+        activateFilePickerEntry(entries[selectedIndex])
+    }
+
+    private func activateFilePickerEntry(_ entry: FilePickerEntry) {
+        if entry.isDirectory {
+            fetchFilePicker(path: entry.path)
+        } else {
+            pendingFilePicker = nil
+            renderFilePicker()
+            perfPathInputController.setText(entry.path)
+            setPerfPath(entry.path)
+        }
+    }
+
+    private func moveFilePickerSelection(delta: Int) {
+        guard let entries = pendingFilePicker?.entries,
+              !entries.isEmpty else { return }
+        let nextIndex = min(max((filePickerSelectedIndex ?? (delta > 0 ? -1 : entries.count)) + delta, 0), entries.count - 1)
+        selectFilePickerIndex(nextIndex)
+    }
+
+    private func selectFilePickerIndex(_ index: Int) {
+        guard let entries = pendingFilePicker?.entries,
+              entries.indices.contains(index) else { return }
+        filePickerSelectedIndex = index
+        ensureFilePickerSelectionVisible()
+        updateFilePickerVisibleRows(rebuild: true)
+    }
+
+    private func ensureFilePickerSelectionVisible() {
+        guard let selectedIndex = filePickerSelectedIndex else { return }
+        let rowTop = CGFloat(selectedIndex) * filePickerRowHeight
+        let viewportHeight = max(filePickerListFrame.height, 1)
+        if rowTop < filePickerScroll {
+            filePickerScroll = rowTop
+        } else if rowTop + filePickerRowHeight > filePickerScroll + viewportHeight {
+            filePickerScroll = rowTop + filePickerRowHeight - viewportHeight
+        }
+        clampFilePickerScroll()
+    }
+
+    private func clampFilePickerSelection() {
+        guard let count = pendingFilePicker?.entries.count,
+              count > 0 else {
+            filePickerSelectedIndex = nil
+            return
+        }
+        if let selectedIndex = filePickerSelectedIndex,
+           selectedIndex >= count {
+            filePickerSelectedIndex = count - 1
+        }
+    }
+
+    private func resetFilePickerTypeahead() {
+        filePickerTypeaheadPrefix = ""
+        filePickerTypeaheadLastUpdated = nil
+    }
+
+    private func handleFilePickerTypeahead(_ text: String) {
+        guard let entries = pendingFilePicker?.entries,
+              !entries.isEmpty else { return }
+        let now = Date()
+        if let last = filePickerTypeaheadLastUpdated,
+           now.timeIntervalSince(last) > 1.0 {
+            filePickerTypeaheadPrefix = ""
+        }
+        filePickerTypeaheadLastUpdated = now
+        filePickerTypeaheadPrefix += text.lowercased()
+        if selectFilePickerEntry(matchingPrefix: filePickerTypeaheadPrefix, in: entries) {
+            return
+        }
+        filePickerTypeaheadPrefix = text.lowercased()
+        _ = selectFilePickerEntry(matchingPrefix: filePickerTypeaheadPrefix, in: entries)
+    }
+
+    private func selectFilePickerEntry(matchingPrefix prefix: String, in entries: [FilePickerEntry]) -> Bool {
+        guard !prefix.isEmpty else { return false }
+        let start = (filePickerSelectedIndex ?? -1) + 1
+        for offset in 0..<entries.count {
+            let index = (start + offset) % entries.count
+            if entries[index].name.lowercased().hasPrefix(prefix) {
+                selectFilePickerIndex(index)
+                return true
+            }
+        }
+        return false
+    }
+
     private func clampFilePickerScroll(contentHeight: CGFloat? = nil, viewportHeight: CGFloat? = nil) {
-        let content = contentHeight ?? max(CGFloat(((pendingFilePicker?.entries.count ?? -1) + 1)) * rowHeight, 1)
+        let content = contentHeight ?? max(filePickerContentHeight, CGFloat(pendingFilePicker?.entries.count ?? 0) * filePickerRowHeight, 1)
         let viewport = viewportHeight ?? max(filePickerListFrame.height, 1)
         filePickerScroll = min(max(filePickerScroll, 0), max(content - viewport, 0))
     }
@@ -4014,7 +4367,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         layer.contentsScale = 2
         layer.truncationMode = .end
         layer.alignmentMode = alignment
-        layer.foregroundColor = NSColor.labelColor.cgColor
+        layer.foregroundColor = resolvedCGColor(NSColor.labelColor)
         return layer
     }
 
