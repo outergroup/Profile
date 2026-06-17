@@ -640,9 +640,17 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             commitFlameZoomLayout()
             updateFlameScrollPosition()
 
-        case .mouseDown(let point, _, let clickCount):
+        case .mouseDown(let point, let modifierFlags, let clickCount):
             if perfMachineUnsupported {
+                if modifierFlags.contains(.control) {
+                    showMachineUnsupportedContextMenu(at: point)
+                    return
+                }
                 handleMachineUnsupportedMouseDown(at: point, clickCount: clickCount)
+                return
+            }
+            if modifierFlags.contains(.control) {
+                handleRightMouseDown(at: point)
                 return
             }
             handleMouseDown(at: point, clickCount: clickCount)
