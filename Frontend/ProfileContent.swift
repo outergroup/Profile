@@ -487,6 +487,8 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     private var processSearchText = ""
     private var processSearchCursorPosition = 0
     private var processSearchSelectionAnchor: Int?
+    private var processSearchMarkedRange: Range<Int>?
+    private var processSearchPendingMarkedRange: Range<Int>?
     private var processSearchFocused = false
     private var perfPath = "perf"
     private var perfUsable = false
@@ -695,6 +697,19 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                             hasReplacementRange: hasReplacementRange,
                             replacementLocation: replacementLocation,
                             replacementLength: replacementLength)
+
+        case .setMarkedText(let text, let selectedLocation, let selectedLength, let hasReplacementRange, let replacementLocation, let replacementLength):
+            guard !perfMachineUnsupported else { return }
+            handleSetMarkedText(text,
+                                selectedLocation: Int(selectedLocation),
+                                selectedLength: Int(selectedLength),
+                                hasReplacementRange: hasReplacementRange,
+                                replacementLocation: Int(replacementLocation),
+                                replacementLength: Int(replacementLength))
+
+        case .unmarkText:
+            guard !perfMachineUnsupported else { return }
+            handleUnmarkText()
 
         case .textCommand(let command):
             guard !perfMachineUnsupported else { return }
@@ -1327,6 +1342,55 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             replacement = nil
         }
         insertProcessSearchText(text, replacementRange: replacement)
+    }
+
+    private func handleSetMarkedText(_ text: String,
+                                     selectedLocation: Int,
+                                     selectedLength: Int,
+                                     hasReplacementRange: Bool,
+                                     replacementLocation: Int,
+                                     replacementLength: Int) {
+        if perfPathInputController.isFocused {
+            perfPathInputController.setMarkedText(text,
+                                                  selectedLocation: selectedLocation,
+                                                  selectedLength: selectedLength,
+                                                  replacementRange: perfPathReplacementRange(hasReplacementRange: hasReplacementRange,
+                                                                                            location: replacementLocation,
+                                                                                            length: replacementLength))
+            return
+        }
+        guard processSearchFocused else { return }
+        setMarkedProcessSearchText(text,
+                                   selectedLocation: selectedLocation,
+                                   selectedLength: selectedLength,
+                                   replacementRange: processSearchReplacementRange(hasReplacementRange: hasReplacementRange,
+                                                                                   location: replacementLocation,
+                                                                                   length: replacementLength))
+    }
+
+    private func handleUnmarkText() {
+        if perfPathInputController.isFocused {
+            perfPathInputController.unmarkText()
+            return
+        }
+        guard processSearchFocused else { return }
+        processSearchPendingMarkedRange = processSearchMarkedRange
+        processSearchMarkedRange = nil
+        updateProcessSearchDisplay()
+    }
+
+    private func perfPathReplacementRange(hasReplacementRange: Bool, location: Int, length: Int) -> Range<Int>? {
+        guard hasReplacementRange else { return nil }
+        let start = min(max(location, 0), perfPathInputController.text.count)
+        let end = min(max(start + length, start), perfPathInputController.text.count)
+        return start..<end
+    }
+
+    private func processSearchReplacementRange(hasReplacementRange: Bool, location: Int, length: Int) -> Range<Int>? {
+        guard hasReplacementRange else { return nil }
+        let start = min(max(location, 0), processSearchText.count)
+        let end = min(max(start + length, start), processSearchText.count)
+        return start..<end
     }
 
     private func handleTextCommand(_ command: String) {
@@ -3162,6 +3226,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         guard processSearchFocused else { return }
         processSearchFocused = false
         processSearchSelectionAnchor = nil
+        clearProcessSearchMarkedTextState()
         updateProcessSearchDisplay()
         updateColors()
         updateTextInputState()
@@ -3203,6 +3268,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         processSearchText = text
         processSearchCursorPosition = min(processSearchCursorPosition, processSearchText.count)
         processSearchSelectionAnchor = nil
+        clearProcessSearchMarkedTextState()
         processScroll = 0
         rebuildProcessContent()
         updateProcessSearchDisplay()
@@ -3211,11 +3277,44 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     }
 
     private func insertProcessSearchText(_ text: String, replacementRange: Range<Int>?) {
-        let range = replacementRange ?? processSearchSelectionRange() ?? processSearchCursorPosition..<processSearchCursorPosition
+        let range = replacementRange
+            ?? processSearchMarkedRange
+            ?? processSearchPendingMarkedRange
+            ?? processSearchSelectionRange()
+            ?? processSearchCursorPosition..<processSearchCursorPosition
         replaceProcessSearchText(range: range, with: text)
     }
 
-    private func replaceProcessSearchText(range: Range<Int>, with replacement: String) {
+    private func setMarkedProcessSearchText(_ text: String,
+                                            selectedLocation: Int,
+                                            selectedLength: Int,
+                                            replacementRange: Range<Int>?) {
+        let range = processSearchNormalizedRange(replacementRange)
+            ?? processSearchMarkedRange
+            ?? processSearchSelectionRange()
+            ?? processSearchCursorPosition..<processSearchCursorPosition
+        let lower = min(max(range.lowerBound, 0), processSearchText.count)
+        processSearchMarkedRange = text.isEmpty ? nil : lower..<(lower + text.count)
+        processSearchPendingMarkedRange = nil
+        replaceProcessSearchText(range: range, with: text, clearsMarkedText: false)
+
+        let selectedLower = min(max(selectedLocation, 0), text.count)
+        let selectedUpper = min(max(selectedLower + selectedLength, selectedLower), text.count)
+        if selectedUpper > selectedLower {
+            processSearchSelectionAnchor = lower + selectedLower
+            processSearchCursorPosition = lower + selectedUpper
+        } else {
+            processSearchSelectionAnchor = nil
+            processSearchCursorPosition = lower + selectedLower
+        }
+        processScroll = 0
+        rebuildProcessContent()
+        updateProcessSearchDisplay()
+        updateProcessScrollPosition()
+        updateTextInputState()
+    }
+
+    private func replaceProcessSearchText(range: Range<Int>, with replacement: String, clearsMarkedText: Bool = true) {
         let lower = min(max(range.lowerBound, 0), processSearchText.count)
         let upper = min(max(range.upperBound, lower), processSearchText.count)
         let start = processSearchText.index(processSearchText.startIndex, offsetBy: lower)
@@ -3223,7 +3322,14 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         processSearchText.replaceSubrange(start..<end, with: replacement)
         processSearchCursorPosition = lower + replacement.count
         processSearchSelectionAnchor = nil
-        setProcessSearchText(processSearchText)
+        if clearsMarkedText {
+            clearProcessSearchMarkedTextState()
+        }
+        processScroll = 0
+        rebuildProcessContent()
+        updateProcessSearchDisplay()
+        updateProcessScrollPosition()
+        updateTextInputState()
     }
 
     private func deleteProcessSearchBackward() {
@@ -3231,6 +3337,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             return
         }
         guard processSearchCursorPosition > 0 else { return }
+        clearProcessSearchMarkedTextState()
         replaceProcessSearchText(range: (processSearchCursorPosition - 1)..<processSearchCursorPosition, with: "")
     }
 
@@ -3239,6 +3346,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             return
         }
         guard processSearchCursorPosition < processSearchText.count else { return }
+        clearProcessSearchMarkedTextState()
         replaceProcessSearchText(range: processSearchCursorPosition..<(processSearchCursorPosition + 1), with: "")
     }
 
@@ -3269,6 +3377,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                                          modifySelection: Bool,
                                          collapsingSelectionTowardStart: Bool? = nil) {
         let clamped = min(max(position, 0), processSearchText.count)
+        clearProcessSearchMarkedTextState()
         if modifySelection {
             if processSearchSelectionAnchor == nil {
                 processSearchSelectionAnchor = processSearchCursorPosition
@@ -3287,10 +3396,23 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
 
     private func selectAllProcessSearchText() {
         guard processSearchFocused else { return }
+        clearProcessSearchMarkedTextState()
         processSearchSelectionAnchor = 0
         processSearchCursorPosition = processSearchText.count
         updateProcessSearchDisplay()
         updateTextInputState()
+    }
+
+    private func processSearchNormalizedRange(_ range: Range<Int>?) -> Range<Int>? {
+        guard let range else { return nil }
+        let lower = min(max(range.lowerBound, 0), processSearchText.count)
+        let upper = min(max(range.upperBound, lower), processSearchText.count)
+        return lower..<upper
+    }
+
+    private func clearProcessSearchMarkedTextState() {
+        processSearchMarkedRange = nil
+        processSearchPendingMarkedRange = nil
     }
 
     private func processSearchSelectionRange() -> Range<Int>? {
