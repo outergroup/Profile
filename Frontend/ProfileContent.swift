@@ -2923,16 +2923,16 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         }
         filePickerTypeaheadLastUpdated = now
         filePickerTypeaheadPrefix += text.lowercased()
-        if selectFilePickerEntry(matchingPrefix: filePickerTypeaheadPrefix, in: entries) {
+        if selectFilePickerEntry(matchingPrefix: filePickerTypeaheadPrefix, in: entries, startingAfterSelection: false) {
             return
         }
         filePickerTypeaheadPrefix = text.lowercased()
-        _ = selectFilePickerEntry(matchingPrefix: filePickerTypeaheadPrefix, in: entries)
+        _ = selectFilePickerEntry(matchingPrefix: filePickerTypeaheadPrefix, in: entries, startingAfterSelection: true)
     }
 
-    private func selectFilePickerEntry(matchingPrefix prefix: String, in entries: [FilePickerEntry]) -> Bool {
+    private func selectFilePickerEntry(matchingPrefix prefix: String, in entries: [FilePickerEntry], startingAfterSelection: Bool) -> Bool {
         guard !prefix.isEmpty else { return false }
-        let start = (filePickerSelectedIndex ?? -1) + 1
+        let start = startingAfterSelection ? (filePickerSelectedIndex ?? -1) + 1 : 0
         for offset in 0..<entries.count {
             let index = (start + offset) % entries.count
             if entries[index].name.lowercased().hasPrefix(prefix) {
