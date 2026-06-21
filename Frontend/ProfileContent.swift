@@ -114,6 +114,72 @@ private struct TimelineBucket {
     let cpuPercent: Double
 }
 
+private final class TimelineBarsLayer: CALayer {
+    private var profileID: UInt64?
+    private var buckets: [TimelineBucket] = []
+    private var timelineDuration: Double = 1
+    private var maxCPU: Double = 100
+    private var barColor: CGColor = NSColor.systemBlue.cgColor
+
+    override init() {
+        super.init()
+        needsDisplayOnBoundsChange = true
+        contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+    }
+
+    override init(layer: Any) {
+        super.init(layer: layer)
+        if let source = layer as? TimelineBarsLayer {
+            profileID = source.profileID
+            buckets = source.buckets
+            timelineDuration = source.timelineDuration
+            maxCPU = source.maxCPU
+            barColor = source.barColor
+        }
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func configure(profileID: UInt64, buckets: [TimelineBucket], duration: Double, maxCPU: Double, barColor: CGColor) {
+        var needsDisplay = false
+        if self.profileID != profileID || self.buckets.count != buckets.count {
+            self.profileID = profileID
+            self.buckets = buckets
+            needsDisplay = true
+        }
+        if self.timelineDuration != duration {
+            self.timelineDuration = duration
+            needsDisplay = true
+        }
+        if self.maxCPU != maxCPU {
+            self.maxCPU = maxCPU
+            needsDisplay = true
+        }
+        if !CFEqual(self.barColor, barColor) {
+            self.barColor = barColor
+            needsDisplay = true
+        }
+        if needsDisplay {
+            setNeedsDisplay()
+        }
+    }
+
+    override func draw(in context: CGContext) {
+        guard bounds.width > 0, bounds.height > 0, timelineDuration > 0, maxCPU > 0 else { return }
+        context.setFillColor(barColor)
+        for bucket in buckets where bucket.samples > 0 {
+            let x0 = CGFloat(bucket.start / timelineDuration) * bounds.width
+            let x1 = CGFloat(bucket.end / timelineDuration) * bounds.width
+            let barWidth = max(x1 - x0, 1)
+            let normalized = min(max(bucket.cpuPercent / maxCPU, 0), 1)
+            let barHeight = max(CGFloat(normalized) * bounds.height, 2)
+            context.fill(CGRect(x: x0, y: 0, width: barWidth, height: barHeight))
+        }
+    }
+}
+
 private struct FoldedStack {
     let count: Int
     let stack: [StackFrame]
@@ -452,6 +518,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     private let traceContentLayer = CALayer()
     private let traceScrollbarLayer = CALayer()
     private let timelineLayer = CALayer()
+    private let timelineBarsLayer = TimelineBarsLayer()
     private let flameLayer = CALayer()
     private let flameDecorationLayer = CALayer()
     private let flameViewportLayer = CALayer()
@@ -1183,7 +1250,17 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
 
     private func handleMouseMoved(at point: CGPoint) {
         updateCursor(at: point)
-        guard !showingSetup, flameLayer.frame.contains(point) else {
+        guard !showingSetup else {
+            hideTooltip()
+            return
+        }
+        if timelineLayer.frame.contains(point) {
+            let timelinePoint = timelineLayer.convert(point, from: rootLayer)
+            if showTimelineTooltip(at: timelinePoint, rootPoint: point) {
+                return
+            }
+        }
+        guard flameLayer.frame.contains(point) else {
             hideTooltip()
             return
         }
@@ -1515,20 +1592,14 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                        y: local.y - contentOriginY)
     }
 
-    private func showTooltip(for hit: FlameHitRegion, at point: CGPoint) {
-        guard hit.total > 0 else {
-            hideTooltip()
-            return
-        }
-        let percent = Double(hit.count) * 100.0 / Double(hit.total)
-        let binary = hit.binary.isEmpty ? "Unknown binary" : hit.binary
-        let text = "\(hit.symbol)\nBinary: \(binary)\nSamples: \(hit.count) of \(hit.total) (\(String(format: "%.1f", percent))%)\nStack depth: \(hit.depth + 1)"
+    private func showTooltip(text: String, at point: CGPoint) {
         tooltipTextLayer.string = text
 
         let maxWidth = min(max(rootLayer.bounds.width * 0.5, 260), 560)
-        let longest = text.components(separatedBy: "\n").map { CGFloat($0.count) }.max() ?? 1
+        let lines = text.components(separatedBy: "\n")
+        let longest = lines.map { CGFloat($0.count) }.max() ?? 1
         let width = min(max(longest * 6.4 + 22, 220), maxWidth)
-        let height = CGFloat(text.components(separatedBy: "\n").count) * 17 + 18
+        let height = CGFloat(lines.count) * 17 + 18
         var frame = CGRect(x: point.x + 14, y: point.y + 16, width: width, height: height)
         if frame.maxX > rootLayer.bounds.maxX - 8 {
             frame.origin.x = point.x - width - 14
@@ -1545,6 +1616,17 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         tooltipTextLayer.frame = tooltipLayer.bounds.insetBy(dx: 11, dy: 8)
         tooltipLayer.isHidden = false
         CATransaction.commit()
+    }
+
+    private func showTooltip(for hit: FlameHitRegion, at point: CGPoint) {
+        guard hit.total > 0 else {
+            hideTooltip()
+            return
+        }
+        let percent = Double(hit.count) * 100.0 / Double(hit.total)
+        let binary = hit.binary.isEmpty ? "Unknown binary" : hit.binary
+        let text = "\(hit.symbol)\nBinary: \(binary)\nSamples: \(hit.count) of \(hit.total) (\(String(format: "%.1f", percent))%)\nStack depth: \(hit.depth + 1)"
+        showTooltip(text: text, at: point)
     }
 
     private func hideTooltip() {
@@ -1716,7 +1798,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         var components = URLComponents(url: profileStartEndpoint, resolvingAgainstBaseURL: false)
         components?.queryItems = [
             URLQueryItem(name: "pid", value: String(selectedPID)),
-            URLQueryItem(name: "frequency", value: "999"),
+            URLQueryItem(name: "frequency", value: "1000"),
             URLQueryItem(name: "perfPath", value: perfPathInputController.text.trimmingCharacters(in: .whitespacesAndNewlines))
         ]
         guard let url = components?.url else { return }
@@ -3811,19 +3893,16 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                 return
             }
 
-            let maxCPU = max(profile.timeline.map(\.cpuPercent).max() ?? 0, 1)
+            let maxCPU = timelineYScale(for: profile)
             let duration = max(Double(profile.duration), profile.timeline.last?.end ?? 1)
-            for bucket in profile.timeline {
-                let x0 = chartRect.minX + CGFloat(bucket.start / duration) * chartRect.width
-                let x1 = chartRect.minX + CGFloat(bucket.end / duration) * chartRect.width
-                let barWidth = max(x1 - x0 - 1, 1)
-                let normalized = min(max(bucket.cpuPercent / maxCPU, 0), 1)
-                let barHeight = max(CGFloat(normalized) * chartRect.height, bucket.samples > 0 ? 2 : 0)
-                let bar = CALayer()
-                bar.frame = CGRect(x: x0, y: chartRect.minY, width: barWidth, height: barHeight)
-                bar.backgroundColor = timelineBarColor.cgColor
-                timelineLayer.addSublayer(bar)
-            }
+            timelineBarsLayer.frame = chartRect
+            timelineBarsLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2
+            timelineBarsLayer.configure(profileID: profile.profileID,
+                                        buckets: profile.timeline,
+                                        duration: duration,
+                                        maxCPU: maxCPU,
+                                        barColor: timelineBarColor.cgColor)
+            timelineLayer.addSublayer(timelineBarsLayer)
 
             let range = selectedRange ?? 0...duration
             let lowerX = chartRect.minX + CGFloat(range.lowerBound / duration) * chartRect.width
@@ -3864,6 +3943,96 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         let duration = max(Double(profile.duration), profile.timeline.last?.end ?? 1)
         let normalized = min(max((point.x - chart.minX) / max(chart.width, 1), 0), 1)
         return Double(normalized) * duration
+    }
+
+    private func timelineYScale(for profile: ProfileResponse) -> Double {
+        max(profile.timeline.map(\.cpuPercent).max() ?? 0, 100)
+    }
+
+    private func timelineBucketIndex(for time: Double, in buckets: [TimelineBucket]) -> Int? {
+        guard !buckets.isEmpty else { return nil }
+        if time >= (buckets.last?.start ?? 0), time <= (buckets.last?.end ?? 0) {
+            return buckets.count - 1
+        }
+        var low = 0
+        var high = buckets.count
+        while low < high {
+            let mid = (low + high) / 2
+            let bucket = buckets[mid]
+            if time < bucket.start {
+                high = mid
+            } else if time >= bucket.end {
+                low = mid + 1
+            } else {
+                return mid
+            }
+        }
+        return nil
+    }
+
+    private func timelineBucketCenterX(_ bucket: TimelineBucket, chart: CGRect, duration: Double) -> CGFloat {
+        let midpoint = (bucket.start + bucket.end) * 0.5
+        return chart.minX + CGFloat(midpoint / duration) * chart.width
+    }
+
+    private func nearbyNonzeroTimelineBucket(at point: CGPoint) -> TimelineBucket? {
+        guard let profile = lastProfile, !profile.timeline.isEmpty else { return nil }
+        let chart = timelineChartRect()
+        guard chart.insetBy(dx: -8, dy: -10).contains(point) else { return nil }
+        let duration = max(Double(profile.duration), profile.timeline.last?.end ?? 1)
+        let normalized = min(max((point.x - chart.minX) / max(chart.width, 1), 0), 1)
+        let time = Double(normalized) * duration
+
+        guard let startingIndex = timelineBucketIndex(for: time, in: profile.timeline) else { return nil }
+        let exactBucket = profile.timeline[startingIndex]
+        if exactBucket.samples > 0 {
+            return exactBucket
+        }
+
+        let tolerance: CGFloat = 7
+        var bestBucket: TimelineBucket?
+        var bestDistance = CGFloat.greatestFiniteMagnitude
+
+        var left = startingIndex - 1
+        while left >= 0 {
+            let bucket = profile.timeline[left]
+            let distance = abs(timelineBucketCenterX(bucket, chart: chart, duration: duration) - point.x)
+            if distance > tolerance {
+                break
+            }
+            if bucket.samples > 0, distance < bestDistance {
+                bestBucket = bucket
+                bestDistance = distance
+            }
+            left -= 1
+        }
+
+        var right = startingIndex + 1
+        while right < profile.timeline.count {
+            let bucket = profile.timeline[right]
+            let distance = abs(timelineBucketCenterX(bucket, chart: chart, duration: duration) - point.x)
+            if distance > tolerance {
+                break
+            }
+            if bucket.samples > 0, distance < bestDistance {
+                bestBucket = bucket
+                bestDistance = distance
+            }
+            right += 1
+        }
+
+        return bestDistance <= tolerance ? bestBucket : nil
+    }
+
+    private func showTimelineTooltip(at point: CGPoint, rootPoint: CGPoint) -> Bool {
+        guard let bucket = nearbyNonzeroTimelineBucket(at: point) else {
+            hideTooltip()
+            return false
+        }
+        let bucketMilliseconds = max(bucket.end - bucket.start, 0) * 1000
+        let text = "\(String(format: "%.1f", bucket.cpuPercent))% (\(String(format: "%.2f", bucketMilliseconds)) ms)\n\(formatDuration(bucket.start)) - \(formatDuration(bucket.end))\nSamples: \(bucket.samples)"
+        showTooltip(text: text, at: rootPoint)
+        return true
     }
 
     private func updateFlameGraph() {

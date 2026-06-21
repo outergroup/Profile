@@ -34,7 +34,9 @@
 #define READ_BUFFER_SIZE 8192
 #define MAX_STACK_DEPTH 128
 #define MAX_PROFILE_AGGREGATES 2000
-#define MAX_TIMELINE_BUCKETS 120
+#define TIMELINE_BUCKET_SECONDS 0.010
+#define MAX_TIMELINE_BUCKETS 300000
+#define MAX_PROFILE_FREQUENCY 1000
 #define MAX_STORED_PROFILES 32
 #define PROFILE_BINARY_VERSION 1
 #define PROFILE_BINARY_PROCESSES 1
@@ -1332,8 +1334,8 @@ static void send_file_picker_binary(int fd, const char *query) {
 static uint32_t timeline_bucket_count_for_run(const ProfileRun *run) {
     double duration = run->end_time - run->start_time;
     if (duration <= 0.0) duration = run->duration > 0 ? (double)run->duration : 1.0;
-    size_t bucket_count = (size_t)(duration * 10.0);
-    if (bucket_count < 20) bucket_count = 20;
+    size_t bucket_count = (size_t)ceil(duration / TIMELINE_BUCKET_SECONDS);
+    if (bucket_count < 1) bucket_count = 1;
     if (bucket_count > MAX_TIMELINE_BUCKETS) bucket_count = MAX_TIMELINE_BUCKETS;
     return (uint32_t)bucket_count;
 }
@@ -1343,16 +1345,28 @@ static bool append_timeline_binary_rows(StringBuilder *binary, const ProfileRun 
     if (duration <= 0.0) duration = run->duration > 0 ? (double)run->duration : 1.0;
     uint32_t bucket_count = timeline_bucket_count_for_run(run);
     double bucket_duration = duration / (double)bucket_count;
+    uint32_t *sample_counts = calloc(bucket_count, sizeof(uint32_t));
+    if (!sample_counts) return false;
 
+    for (size_t i = 0; i < run->samples.count; i++) {
+        double offset = run->samples.items[i].timestamp - run->start_time;
+        if (offset < 0.0) continue;
+        uint32_t bucket_index = (uint32_t)(offset / bucket_duration);
+        if (bucket_index >= bucket_count) {
+            if (run->samples.items[i].timestamp <= run->end_time) {
+                bucket_index = bucket_count - 1;
+            } else {
+                continue;
+            }
+        }
+        if (sample_counts[bucket_index] < UINT32_MAX) sample_counts[bucket_index]++;
+    }
+
+    bool ok = true;
     for (uint32_t i = 0; i < bucket_count; i++) {
         double start = run->start_time + (double)i * bucket_duration;
         double end = (i + 1 == bucket_count) ? run->end_time : start + bucket_duration;
-        uint32_t samples = 0;
-        for (size_t j = 0; j < run->samples.count; j++) {
-            double t = run->samples.items[j].timestamp;
-            bool in_bucket = (i + 1 == bucket_count) ? (t >= start && t <= end) : (t >= start && t < end);
-            if (in_bucket) samples++;
-        }
+        uint32_t samples = sample_counts[i];
         double cpu_percent = 0.0;
         if (run->frequency > 0 && bucket_duration > 0.0) {
             cpu_percent = ((double)samples * 100.0) / ((double)run->frequency * bucket_duration);
@@ -1362,10 +1376,12 @@ static bool append_timeline_binary_rows(StringBuilder *binary, const ProfileRun 
             !sb_append_f64(binary, cpu_percent) ||
             !sb_append_u32(binary, samples) ||
             !sb_append_u32(binary, 0)) {
-            return false;
+            ok = false;
+            break;
         }
     }
-    return true;
+    free(sample_counts);
+    return ok;
 }
 
 static bool send_binary_builder(int fd, StringBuilder *binary) {
@@ -1781,7 +1797,7 @@ static void send_profile_capture(int fd, const char *query) {
     int frequency = 99;
     if (query_value(query, "frequency", value, sizeof(value))) frequency = atoi(value);
     if (frequency < 19) frequency = 19;
-    if (frequency > 999) frequency = 999;
+    if (frequency > MAX_PROFILE_FREQUENCY) frequency = MAX_PROFILE_FREQUENCY;
 
     char perf_error[1024];
     if (!cached_perf_ready(perf_error, sizeof(perf_error))) {
@@ -1887,10 +1903,10 @@ static void send_profile_start(int fd, const char *query) {
         send_text_response(fd, 400, "invalid pid\n");
         return;
     }
-    int frequency = 999;
+    int frequency = MAX_PROFILE_FREQUENCY;
     if (query_value(query, "frequency", value, sizeof(value))) frequency = atoi(value);
     if (frequency < 19) frequency = 19;
-    if (frequency > 999) frequency = 999;
+    if (frequency > MAX_PROFILE_FREQUENCY) frequency = MAX_PROFILE_FREQUENCY;
     char perf_path[PATH_MAX];
     if (query_value(query, "perfPath", perf_path, sizeof(perf_path)) && perf_path[0]) {
         snprintf(g_perf_path, sizeof(g_perf_path), "%s", perf_path);
