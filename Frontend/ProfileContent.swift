@@ -963,10 +963,10 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
 
     private func updateColors() {
         appearance.performAsCurrentDrawingAppearance {
-            rootLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
+            rootLayer.backgroundColor = pageBackgroundColor.cgColor
             toolbarLayer.backgroundColor = toolbarColor.cgColor
             sidebarLayer.backgroundColor = sidebarBackgroundColor.cgColor
-            processListLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
+            processListLayer.backgroundColor = pageBackgroundColor.cgColor
             processSearchLayer.backgroundColor = searchFieldBackgroundColor.cgColor
             processSearchLayer.borderColor = (processSearchFocused ? NSColor.keyboardFocusIndicatorColor : NSColor.separatorColor).cgColor
             processSearchLayer.borderWidth = processSearchFocused ? 1.5 : 1
@@ -976,8 +976,8 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             processSearchCursorLayer.backgroundColor = NSColor.labelColor.cgColor
             updateSymbolLayer(processSearchIconLayer, symbolName: "magnifyingglass", color: NSColor.secondaryLabelColor)
             filePickerScrollbarController?.updateAppearance(appearance)
-            timelineLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
-            flameLayer.backgroundColor = NSColor.windowBackgroundColor.cgColor
+            timelineLayer.backgroundColor = pageBackgroundColor.cgColor
+            flameLayer.backgroundColor = pageBackgroundColor.cgColor
             statusLayer.foregroundColor = NSColor.secondaryLabelColor.cgColor
             tooltipLayer.backgroundColor = tooltipBackgroundColor.cgColor
             tooltipLayer.borderColor = NSColor.separatorColor.cgColor
@@ -1019,9 +1019,11 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         flameLayer.frame = CGRect(x: contentX, y: 0, width: contentWidth, height: max(contentHeight - timelineLayer.frame.height, 1))
 
         recordToggleButtonLayer.frame = CGRect(x: sidebarWidth - 50, y: height - toolbarHeight + 11, width: 34, height: 30)
-        refreshButtonLayer.frame = CGRect(x: horizontalInset, y: 11, width: 84, height: 30)
+        let refreshButtonWidth: CGFloat = 84
+        let statusGap: CGFloat = 18
+        refreshButtonLayer.frame = CGRect(x: horizontalInset, y: 11, width: refreshButtonWidth, height: 30)
         refreshButtonLayer.isHidden = !showingSetup
-        let statusX = showingSetup ? contentX + 112 : contentX + horizontalInset
+        let statusX = showingSetup ? contentX + refreshButtonLayer.frame.maxX + statusGap : contentX + horizontalInset
         let statusRightInset: CGFloat = showingSetup ? 16 : horizontalInset
         statusLayer.frame = CGRect(x: statusX, y: height - 35, width: max(width - statusX - statusRightInset, 1), height: 18)
         refreshButtonLayer.sublayers?.first?.frame = refreshButtonLayer.bounds.insetBy(dx: 10, dy: 6)
@@ -1110,8 +1112,8 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             lastProfile = nil
             selectedRange = nil
             statusLayer.string = "Choose a process for the next recording."
-            fetchProcesses()
             updateColors()
+            fetchProcesses()
             return
         }
 
@@ -1686,13 +1688,25 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                         self.selectedPID = nil
                     }
                     self.clampProcessScroll()
-                    self.statusLayer.string = self.selectedPID == nil ? self.nextRecordingStatusText() : self.statusLayer.string
+                    if self.showingSetup {
+                        self.statusLayer.string = self.setupStatusText()
+                    }
                     self.updateColors()
                 } else {
-                    self.statusLayer.string = error?.localizedDescription ?? "Could not load processes."
+                    if self.showingSetup {
+                        self.statusLayer.string = error?.localizedDescription ?? "Could not load processes."
+                    }
                 }
             }
         }.resume()
+    }
+
+    private func setupStatusText() -> String {
+        if let selectedPID,
+           let process = processes.first(where: { $0.pid == selectedPID }) {
+            return "Next recording target: \(process.name) (\(process.pid))."
+        }
+        return nextRecordingStatusText()
     }
 
     private func nextRecordingStatusText() -> String {
@@ -4503,6 +4517,10 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
 
     private var toolbarColor: NSColor {
         isDarkMode ? NSColor.controlBackgroundColor.withAlphaComponent(0.72) : NSColor.controlBackgroundColor
+    }
+
+    private var pageBackgroundColor: NSColor {
+        NSColor.controlBackgroundColor
     }
 
     private var sidebarBackgroundColor: NSColor {
