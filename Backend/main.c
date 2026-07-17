@@ -25,6 +25,8 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#include "HTTPCache.h"
 #ifdef __linux__
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
@@ -221,6 +223,38 @@ static void send_text_response(int fd, int status, const char *message) {
     send_response(fd, status, status_text, "text/plain; charset=utf-8", message, strlen(message));
 }
 
+static void send_cached_header(int fd,
+                               int status,
+                               const char *content_type,
+                               size_t content_length,
+                               const char *etag,
+                               const char *last_modified) {
+    char header[1024];
+    size_t header_length = outer_http_cache_response_header(header, sizeof(header), status,
+                                                            content_type, content_length,
+                                                            etag, last_modified);
+    if (header_length > 0) queue_all(fd, header, header_length);
+}
+
+static void send_cached_memory_response(int fd,
+                                        const char *request,
+                                        size_t request_header_length,
+                                        const char *content_type,
+                                        const void *body,
+                                        size_t body_length,
+                                        bool send_body) {
+    time_t last_modified = outer_http_cache_server_start_time();
+    char etag[96], last_modified_text[64];
+    outer_http_cache_memory_etag(body, body_length, etag, sizeof(etag));
+    outer_http_cache_format_date(last_modified, last_modified_text, sizeof(last_modified_text));
+    if (outer_http_cache_not_modified(request, request_header_length, etag, &last_modified)) {
+        send_cached_header(fd, 304, content_type, 0, etag, last_modified_text);
+        return;
+    }
+    send_cached_header(fd, 200, content_type, body_length, etag, last_modified_text);
+    if (send_body && body_length > 0) queue_all(fd, body, body_length);
+}
+
 static bool read_process_cpu_ticks(int pid, uint64_t *ticks_out) {
     if (ticks_out) *ticks_out = 0;
 #ifndef __linux__
@@ -301,7 +335,10 @@ static bool sb_append_binary_header(StringBuilder *builder, uint32_t type) {
            sb_append_u32(builder, 0);
 }
 
-static void send_outer_descriptor(int fd) {
+static void send_outer_descriptor(int fd,
+                                  const char *request,
+                                  size_t request_header_length,
+                                  bool send_body) {
     const char *plugin_payload = "{\"processesAPIPath\":\"/api/processes\",\"profileAPIPath\":\"/api/profile\",\"profileStartAPIPath\":\"/api/profile/start\",\"profileStopAPIPath\":\"/api/profile/stop\",\"profileStatusAPIPath\":\"/api/profile/status\",\"profileListAPIPath\":\"/api/profiles\",\"profileRangeAPIPath\":\"/api/profile/range\",\"profileDeleteAPIPath\":\"/api/profile/delete\",\"perfAPIPath\":\"/api/perf\",\"filePickerAPIPath\":\"/api/file-picker\"}";
     size_t path_len = strlen(kBundleUrlPath);
     size_t plugin_len = strlen(plugin_payload);
@@ -324,11 +361,17 @@ static void send_outer_descriptor(int fd) {
     write_uint64_le(payload + 32, (uint64_t)plugin_len);
     memcpy(payload + header_len, kBundleUrlPath, path_len);
     memcpy(payload + data_offset, plugin_payload, plugin_len);
-    send_response(fd, 200, "OK", "application/vnd.outerframe", payload, total_len);
+    send_cached_memory_response(fd, request, request_header_length,
+                                "application/vnd.outerframe", payload, total_len,
+                                send_body);
     free(payload);
 }
 
-static void send_bundle_file(int fd, const char *path) {
+static void send_bundle_file(int fd,
+                             const char *path,
+                             const char *request,
+                             size_t request_header_length,
+                             bool send_body) {
     int file_fd = open(path, O_RDONLY);
     if (file_fd < 0) {
         send_text_response(fd, 404, "bundle not found\n");
@@ -340,7 +383,20 @@ static void send_bundle_file(int fd, const char *path) {
         send_text_response(fd, 500, "failed to stat bundle\n");
         return;
     }
+    char etag[96], last_modified[64];
+    outer_http_cache_file_etag(&st, etag, sizeof(etag));
+    outer_http_cache_format_date(st.st_mtime, last_modified, sizeof(last_modified));
+    if (outer_http_cache_not_modified(request, request_header_length, etag, &st.st_mtime)) {
+        close(file_fd);
+        send_cached_header(fd, 304, "application/octet-stream", 0, etag, last_modified);
+        return;
+    }
     size_t size = (size_t)st.st_size;
+    if (!send_body) {
+        close(file_fd);
+        send_cached_header(fd, 200, "application/octet-stream", size, etag, last_modified);
+        return;
+    }
     unsigned char *data = malloc(size ? size : 1);
     if (!data) {
         close(file_fd);
@@ -361,7 +417,13 @@ static void send_bundle_file(int fd, const char *path) {
         offset += (size_t)got;
     }
     close(file_fd);
-    send_response(fd, 200, "OK", "application/octet-stream", data, offset);
+    if (offset != size) {
+        free(data);
+        send_text_response(fd, 500, "failed to read bundle\n");
+        return;
+    }
+    send_cached_header(fd, 200, "application/octet-stream", size, etag, last_modified);
+    if (size > 0) queue_all(fd, data, size);
     free(data);
 }
 
@@ -2117,6 +2179,8 @@ static void handle_client(int fd) {
     ssize_t got = read(fd, buffer, READ_BUFFER_SIZE);
     if (got <= 0) return;
     buffer[got] = '\0';
+    char *header_end = strstr(buffer, "\r\n\r\n");
+    size_t request_header_length = header_end ? (size_t)(header_end + 4 - buffer) : (size_t)got;
 
     char method[8] = "";
     char target[2048] = "";
@@ -2133,13 +2197,15 @@ static void handle_client(int fd) {
     if (strcasecmp(method, "GET") != 0 && strcasecmp(method, "HEAD") != 0 && strcasecmp(method, "POST") != 0) {
         send_text_response(fd, 400, "unsupported method\n");
     } else if (strcmp(target, "/") == 0 || strcmp(target, "/index.outer") == 0) {
-        send_outer_descriptor(fd);
+        send_outer_descriptor(fd, buffer, request_header_length, !g_current_request_is_head);
     } else if (strcmp(target, kBundleUrlPath) == 0) {
         send_text_response(fd, 200, "macos-arm\nmacos-x86\n");
     } else if (strcmp(target, kBundleUrlPathMacosArm) == 0) {
-        send_bundle_file(fd, g_bundle_file_path_macos_arm);
+        send_bundle_file(fd, g_bundle_file_path_macos_arm,
+                         buffer, request_header_length, !g_current_request_is_head);
     } else if (strcmp(target, kBundleUrlPathMacosX86) == 0) {
-        send_bundle_file(fd, g_bundle_file_path_macos_x86);
+        send_bundle_file(fd, g_bundle_file_path_macos_x86,
+                         buffer, request_header_length, !g_current_request_is_head);
     } else if (strcmp(target, "/api/processes") == 0) {
         send_processes_binary(fd);
     } else if (strcmp(target, "/api/profile") == 0) {
