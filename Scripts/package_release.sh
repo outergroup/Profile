@@ -19,6 +19,8 @@ require_file() {
 
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/ProfileBackend"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/ProfileBackend"
+require_file "${PACKAGE_ROOT}/RemoteLinuxBinariesMusl/aarch64/ProfileBackend"
+require_file "${PACKAGE_ROOT}/RemoteLinuxBinariesMusl/x86_64/ProfileBackend"
 require_file "${REPO_ROOT}/app-icon.png"
 
 mkdir -p "${OUTPUT_ROOT}" "${PACKAGE_ROOT}/bundles"
@@ -50,13 +52,16 @@ mkdir -p "${OUTPUT_APP_ROOT}"
 
 package_linux_variant() {
     local arch="$1"
-    local output_name="$2"
+    local libc="$2"
+    local output_name="$3"
+    local binary_directory=RemoteLinuxBinaries
+    [[ "${libc}" == musl ]] && binary_directory=RemoteLinuxBinariesMusl
     local app_root="${STAGING_ROOT}/Profile"
     rm -rf "${app_root}"
     mkdir -p \
-        "${app_root}/RemoteLinuxBinaries/${arch}" \
+        "${app_root}/${binary_directory}/${arch}" \
         "${app_root}/bundles"
-    install -m 0755 "${PACKAGE_ROOT}/RemoteLinuxBinaries/${arch}/ProfileBackend" "${app_root}/RemoteLinuxBinaries/${arch}/ProfileBackend"
+    install -m 0755 "${PACKAGE_ROOT}/${binary_directory}/${arch}/ProfileBackend" "${app_root}/${binary_directory}/${arch}/ProfileBackend"
     install -m 0644 "${PACKAGE_ROOT}/bundles/ProfileContent.bundle.macos-arm.aar" "${app_root}/bundles/ProfileContent.bundle.macos-arm.aar"
     install -m 0644 "${PACKAGE_ROOT}/bundles/ProfileContent.bundle.macos-x86.aar" "${app_root}/bundles/ProfileContent.bundle.macos-x86.aar"
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_root}/app-icon.png"
@@ -64,5 +69,7 @@ package_linux_variant() {
     echo "Packaged ${OUTPUT_APP_ROOT}/${output_name}.tar.gz"
 }
 
-package_linux_variant aarch64 linux-aarch64
-package_linux_variant x86_64 linux-x86_64
+package_linux_variant aarch64 glibc linux-aarch64
+package_linux_variant x86_64 glibc linux-x86_64
+package_linux_variant aarch64 musl linux-aarch64-musl
+package_linux_variant x86_64 musl linux-x86_64-musl
