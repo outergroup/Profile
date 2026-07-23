@@ -1,0 +1,101 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+  <title>Profile</title>
+  <link rel="stylesheet" href="/web/app.css">
+</head>
+<body>
+  <main>
+    <div id="drawerScrim" class="drawer-scrim"></div>
+    <aside id="recordingSidebar" aria-label="Recordings">
+      <div class="sidebar-heading">
+        <h3>PROFILE</h3>
+        <button id="sidebarClose" class="sidebar-close" type="button" aria-label="Close recordings">×</button>
+      </div>
+      <button id="nextRecording" class="next-recording selected" type="button">
+        <span class="target-mark"></span>
+        <span><strong>Next Recording</strong><small id="sidebarTarget">Choose a target</small></span>
+      </button>
+      <h3>TRACES</h3>
+      <div id="traces" class="trace-list"></div>
+    </aside>
+
+    <section class="content">
+      <section id="setupView" class="setup-view">
+        <header class="setup-toolbar">
+          <button class="sidebar-toggle" type="button" aria-label="Show recordings" aria-controls="recordingSidebar" aria-expanded="false"><span class="menu-glyph" aria-hidden="true">☰</span><span class="sidebar-toggle-label">Traces</span></button>
+          <button id="record" class="record" type="button" aria-label="Start recording"><span></span></button>
+          <button id="refreshProcesses" class="refresh" type="button">Refresh</button>
+          <span id="setupStatus">Choose a process for the next recording.</span>
+        </header>
+
+        <div class="setup-body">
+          <div class="setup-heading">
+            <h1>Next Recording</h1>
+            <p id="setupSubtitle">Choose a process, then press Record.</p>
+          </div>
+          <label class="process-search">
+            <span aria-hidden="true"></span>
+            <input id="processSearch" type="search" placeholder="Search processes" autocomplete="off" spellcheck="false">
+          </label>
+          <div id="processes" class="process-table" role="listbox" aria-label="Processes"></div>
+          <div class="perf-setting">
+            <label for="perfPath">Path to perf executable</label>
+            <div>
+              <input id="perfPath" value="/usr/bin/perf" spellcheck="false">
+              <button id="selectPerf" type="button">Select</button>
+            </div>
+            <small id="perfMessage"></small>
+          </div>
+        </div>
+      </section>
+
+      <section id="profileView" class="profile-view" hidden>
+        <header class="profile-toolbar">
+          <button class="sidebar-toggle" type="button" aria-label="Show recordings" aria-controls="recordingSidebar" aria-expanded="false"><span class="menu-glyph" aria-hidden="true">☰</span><span class="sidebar-toggle-label">Traces</span></button>
+          <button id="recordProfile" class="record" type="button" aria-label="Start recording"><span></span></button>
+          <span id="summary">No recording selected.</span>
+          <span class="spacer"></span>
+          <button id="zoomOut" type="button">−</button>
+          <button id="zoomIn" type="button">＋</button>
+          <button id="zoomReset" type="button">100%</button>
+        </header>
+        <section class="timeline-wrap">
+          <label>CPU Usage</label>
+          <div id="timeline" class="timeline">
+            <canvas id="chart"></canvas>
+            <div id="shadeLeft" class="shade left"></div>
+            <div id="shadeRight" class="shade right"></div>
+            <i id="leftHandle" class="handle left"></i>
+            <i id="rightHandle" class="handle right"></i>
+          </div>
+          <div id="rangeLabel">No recording selected</div>
+        </section>
+        <section class="flame-wrap">
+          <div id="flameTitle"></div>
+          <div id="flameViewport"><div id="flame"></div></div>
+        </section>
+      </section>
+    </section>
+  </main>
+
+  <dialog id="perfPicker">
+    <form method="dialog" class="picker-shell">
+      <header>
+        <button value="cancel" type="submit">Cancel</button>
+        <strong>Select perf executable</strong>
+        <button id="choosePerf" value="default" type="button" disabled>Choose</button>
+      </header>
+      <div class="picker-path">
+        <button id="pickerUp" type="button" aria-label="Parent folder">‹</button>
+        <span id="pickerPath">/</span>
+      </div>
+      <div id="pickerEntries" class="picker-entries"></div>
+    </form>
+  </dialog>
+
+  <script src="/web/app.js"></script>
+</body>
+</html>

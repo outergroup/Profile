@@ -59,6 +59,7 @@ static const char *kBundleFilePathMacosX86 = "ProfileContent.bundle.macos-x86.aa
 
 static char g_bundle_file_path_macos_arm[PATH_MAX] = "";
 static char g_bundle_file_path_macos_x86[PATH_MAX] = "";
+static char g_web_root[PATH_MAX] = "";
 static char g_backend_label[256] = "org.outershell.Profile";
 static char g_perf_path[PATH_MAX] = "";
 static bool g_perf_status_checked = false;
@@ -253,6 +254,58 @@ static void send_cached_memory_response(int fd,
     }
     send_cached_header(fd, 200, content_type, body_length, etag, last_modified_text);
     if (send_body && body_length > 0) queue_all(fd, body, body_length);
+}
+
+static bool request_accepts_outerframe(const char *request, size_t request_length) {
+    static const char needle[] = "application/vnd.outerframe";
+    return request && request_length >= sizeof(needle) - 1 &&
+           memmem(request, request_length, needle, sizeof(needle) - 1) != NULL;
+}
+
+static void send_web_file(int fd, const char *name, const char *content_type,
+                          const char *request, size_t request_length, bool send_body) {
+    if (!g_web_root[0] || !name || strchr(name, '/')) {
+        send_text_response(fd, 404, "web frontend not installed\n");
+        return;
+    }
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/%s", g_web_root, name) >= (int)sizeof(path)) {
+        send_text_response(fd, 404, "not found\n");
+        return;
+    }
+    int file_fd = open(path, O_RDONLY);
+    if (file_fd < 0) {
+        send_text_response(fd, 404, "web frontend not installed\n");
+        return;
+    }
+    struct stat st;
+    if (fstat(file_fd, &st) != 0 || st.st_size < 0) {
+        close(file_fd);
+        send_text_response(fd, 500, "failed to stat web asset\n");
+        return;
+    }
+    size_t size = (size_t)st.st_size;
+    unsigned char *data = malloc(size ? size : 1);
+    if (!data) {
+        close(file_fd);
+        send_text_response(fd, 500, "out of memory\n");
+        return;
+    }
+    size_t used = 0;
+    while (used < size) {
+        ssize_t n = read(file_fd, data + used, size - used);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        used += (size_t)n;
+    }
+    close(file_fd);
+    if (used != size) {
+        free(data);
+        send_text_response(fd, 500, "failed to read web asset\n");
+        return;
+    }
+    send_cached_memory_response(fd, request, request_length, content_type, data, size, send_body);
+    free(data);
 }
 
 static bool read_process_cpu_ticks(int pid, uint64_t *ticks_out) {
@@ -2196,6 +2249,15 @@ static void handle_client(int fd) {
 
     if (strcasecmp(method, "GET") != 0 && strcasecmp(method, "HEAD") != 0 && strcasecmp(method, "POST") != 0) {
         send_text_response(fd, 400, "unsupported method\n");
+    } else if (strcmp(target, "/") == 0 && !request_accepts_outerframe(buffer, request_header_length)) {
+        send_web_file(fd, "index.html", "text/html; charset=utf-8", buffer, request_header_length,
+                      !g_current_request_is_head);
+    } else if (strcmp(target, "/web/app.css") == 0) {
+        send_web_file(fd, "app.css", "text/css; charset=utf-8", buffer, request_header_length,
+                      !g_current_request_is_head);
+    } else if (strcmp(target, "/web/app.js") == 0) {
+        send_web_file(fd, "app.js", "text/javascript; charset=utf-8", buffer, request_header_length,
+                      !g_current_request_is_head);
     } else if (strcmp(target, "/") == 0 || strcmp(target, "/index.outer") == 0) {
         send_outer_descriptor(fd, buffer, request_header_length, !g_current_request_is_head);
     } else if (strcmp(target, kBundleUrlPath) == 0) {
@@ -2303,7 +2365,7 @@ static int systemd_activated_listener(void) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--label LABEL] [--bundles-dir DIR]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--label LABEL] [--bundles-dir DIR] [--web-root DIR]\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -2320,6 +2382,8 @@ int main(int argc, char **argv) {
             snprintf(g_backend_label, sizeof(g_backend_label), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--bundles-dir") == 0 && i + 1 < argc) {
             bundles_dir = argv[++i];
+        } else if (strcmp(argv[i], "--web-root") == 0 && i + 1 < argc) {
+            snprintf(g_web_root, sizeof(g_web_root), "%s", argv[++i]);
         } else if ((strcmp(argv[i], "--api-socket-path") == 0 || strcmp(argv[i], "--icon-file") == 0) && i + 1 < argc) {
             i++;
         } else if (strcmp(argv[i], "--help") == 0) {
@@ -2333,6 +2397,7 @@ int main(int argc, char **argv) {
 
     snprintf(g_bundle_file_path_macos_arm, sizeof(g_bundle_file_path_macos_arm), "%s/%s", bundles_dir, kBundleFilePathMacosArm);
     snprintf(g_bundle_file_path_macos_x86, sizeof(g_bundle_file_path_macos_x86), "%s/%s", bundles_dir, kBundleFilePathMacosX86);
+    if (!g_web_root[0]) snprintf(g_web_root, sizeof(g_web_root), "%s/../web", bundles_dir);
     refresh_perf_status();
     if (!g_perf_status_usable) {
         log_perf_diagnostic("perf startup check failed", g_perf_status_message);
