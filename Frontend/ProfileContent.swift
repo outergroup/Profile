@@ -835,8 +835,11 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             guard !perfMachineUnsupported else { return }
             insertPasteboardItemsIntoFocusedField(items)
 
+        case .accessibilityAction(let identifier, let action, let value):
+            performAccessibilityAction(identifier, action: action, value: value)
+
         case .accessibilitySnapshotRequest(let requestID):
-            outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID, snapshot: nil)
+            outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID, snapshot: accessibilitySnapshot())
 
         case .shutdown:
             retainedSelf = nil
@@ -961,7 +964,182 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         hasRegisteredLayer = true
     }
 
+    private var accessibilityIDs: [String: UInt32] = [:]
+    private var accessibilityActions: [UInt32: (ProfileHandler, OuterframeAccessibilityAction, String) -> Void] = [:]
+    private var accessibilityNodes: [UInt32: OuterframeAccessibilityNode] = [:]
+    private var accessibilityNotificationPending = false
+
+    private func notifyAccessibilityChanged() {
+        guard hasRegisteredLayer, !accessibilityNotificationPending else { return }
+        accessibilityNotificationPending = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            accessibilityNotificationPending = false
+            outerframeHost.notifyAccessibilityTreeChanged(.layoutChanged)
+        }
+    }
+
+    private func accessibilityNode(_ key: String, role: OuterframeAccessibilityRole, frame: CGRect,
+                                   label: String, value: String? = nil, hint: String? = nil,
+                                   children: [OuterframeAccessibilityNode] = [], enabled: Bool = true,
+                                   actions: OuterframeAccessibilityActions = [], selected: Bool = false,
+                                   focused: Bool = false, rowIndex: Int? = nil, rowCount: Int? = nil,
+                                   handler: ((ProfileHandler, OuterframeAccessibilityAction, String) -> Void)? = nil) -> OuterframeAccessibilityNode {
+        let id: UInt32
+        if let existing = accessibilityIDs[key] { id = existing }
+        else { id = UInt32(accessibilityIDs.count + 1); accessibilityIDs[key] = id }
+        let node = OuterframeAccessibilityNode(identifier: id, role: role, frame: frame, label: label,
+            value: value, hint: hint, children: children, rowCount: rowCount, isEnabled: enabled,
+            actions: actions, isFocused: focused, isSelected: selected, rowIndex: rowIndex)
+        accessibilityNodes[id] = node
+        accessibilityActions[id] = handler
+        return node
+    }
+
+    private func performAccessibilityAction(_ identifier: UInt32, action: OuterframeAccessibilityAction, value: String) {
+        _ = accessibilitySnapshot()
+        guard let node = accessibilityNodes[identifier], node.isEnabled, node.actions.supports(action),
+              let handler = accessibilityActions[identifier] else { return }
+        handler(self, action, value)
+        notifyAccessibilityChanged()
+    }
+
+    private func accessibilitySnapshot() -> OuterframeAccessibilitySnapshot {
+        accessibilityNodes.removeAll(keepingCapacity: true)
+        accessibilityActions.removeAll(keepingCapacity: true)
+        func frame(_ layer: CALayer) -> CGRect { rootLayer.convert(layer.bounds, from: layer) }
+        if perfMachineUnsupported {
+            return OuterframeAccessibilitySnapshot(rootNodes: [accessibilityNode("unsupported", role: .staticText,
+                frame: machineUnsupportedPanelFrame, label: "Profiling unavailable",
+                value: machineUnsupportedTextLines.map(\.text).joined(separator: "\n"))])
+        }
+        if let picker = pendingFilePicker {
+            var children: [OuterframeAccessibilityNode] = []
+            for segment in filePickerBreadcrumbSegmentFrames {
+                children.append(accessibilityNode("picker-path/" + segment.path, role: .button, frame: segment.frame,
+                    label: segment.path, actions: [.press]) { owner, _, _ in owner.fetchFilePicker(path: segment.path) })
+            }
+            let rows = filePickerEntryFrames.filter { $0.frame.intersects(filePickerListFrame) }.map { item in
+                accessibilityNode("picker-entry/" + item.entry.path, role: .row, frame: item.frame,
+                    label: item.entry.name, value: item.entry.isDirectory ? "Folder" : "File",
+                    hint: "Open", actions: [.press, .focus], selected: filePickerSelectedIndex == item.index,
+                    rowIndex: item.index) { owner, action, _ in
+                        owner.filePickerSelectedIndex = item.index
+                        if action == .press { owner.activateFilePickerEntry(item.entry) }
+                        else { owner.updateFilePickerVisibleRows(rebuild: true) }
+                    }
+            }
+            children.append(accessibilityNode("picker-list", role: .table, frame: filePickerListFrame, label: "Choose perf executable",
+                children: rows, actions: [.scrollUp, .scrollDown], rowCount: picker.entries.count) { owner, action, _ in
+                    owner.setFilePickerScroll(owner.filePickerScroll + (action == .scrollDown ? 1 : -1) * owner.filePickerListFrame.height * 0.8)
+                })
+            children.append(accessibilityNode("picker-cancel", role: .button, frame: filePickerCancelFrame, label: "Cancel",
+                actions: [.press]) { owner, _, _ in owner.pendingFilePicker = nil; owner.renderFilePicker() })
+            return OuterframeAccessibilitySnapshot(rootNodes: [accessibilityNode("picker", role: .container,
+                frame: filePickerPanelFrame, label: "Choose perf executable", value: picker.path, children: children)])
+        }
+        var children = [accessibilityNode("status", role: .staticText, frame: frame(statusLayer), label: "Status", value: statusLayer.string as? String)]
+        children.append(accessibilityNode("record", role: .button, frame: frame(recordToggleButtonLayer),
+            label: isRecording ? "Stop recording" : "Start recording",
+            enabled: !isBusy && (isRecording || (perfUsable && selectedPID != nil)), actions: [.press]) { owner, _, _ in
+                if owner.isRecording { owner.stopRecording() } else { owner.startRecording() }
+            })
+        children.append(accessibilityNode("setup", role: .button, frame: sidebarLayer.convert(nextRecordingFrame(), to: rootLayer),
+            label: "Next Recording", actions: [.press], selected: showingSetup) { owner, _, _ in
+                let rect = owner.nextRecordingFrame()
+                owner.handleSidebarClick(at: CGPoint(x: rect.midX, y: rect.midY))
+            })
+        var traceNodes: [OuterframeAccessibilityNode] = []
+        for (index, trace) in traces.enumerated().reversed() {
+            let rect = traceContentLayer.convert(traceFrame(visualIndex: activeRecordingTraceRowCount() + traces.count - 1 - index), to: rootLayer)
+            guard rect.intersects(frame(traceViewportLayer)) else { continue }
+            traceNodes.append(accessibilityNode("trace/\(trace.profileID)", role: .row, frame: rect,
+                label: "Run \(trace.profileID)", value: "PID \(trace.pid), \(String(format: "%.2f", trace.duration)) seconds, \(trace.sampleCount) samples",
+                actions: [.press, .focus, .showMenu], selected: selectedTraceID == trace.profileID, rowIndex: traces.count - 1 - index) { owner, action, _ in
+                    if action == .showMenu {
+                        owner.handleRightMouseDown(at: CGPoint(x: rect.midX, y: rect.midY))
+                    } else if let current = owner.traces.firstIndex(where: { $0.profileID == trace.profileID }) { owner.selectTrace(at: current) }
+                })
+        }
+        children.append(accessibilityNode("traces", role: .table, frame: frame(traceViewportLayer), label: "Recordings", children: traceNodes,
+            actions: [.scrollUp, .scrollDown], rowCount: traces.count) { owner, action, _ in
+                owner.traceScroll += (action == .scrollDown ? 1 : -1) * owner.traceViewportLayer.bounds.height * 0.8
+                owner.clampTraceScroll(); owner.updateTraceScrollPosition()
+            })
+        if showingSetup {
+            children.append(accessibilityNode("refresh", role: .button, frame: frame(refreshButtonLayer), label: "Refresh processes",
+                enabled: !isBusy && !isRecording, actions: [.press]) { owner, _, _ in owner.fetchProcesses() })
+            children.append(accessibilityNode("search", role: .textField, frame: frame(processSearchLayer), label: "Search processes",
+                value: processSearchText, enabled: !isRecording, actions: [.focus, .setValue], focused: processSearchFocused) { owner, action, value in
+                    owner.blurPerfPath(commit: true)
+                    owner.focusProcessSearch(cursorPosition: owner.processSearchText.count, modifySelection: false)
+                    if action == .setValue { owner.setProcessSearchText(value) }
+                })
+            let viewport = frame(processViewportLayer)
+            var rows: [OuterframeAccessibilityNode] = []
+            let table = processTableFrame()
+            for (index, sourceIndex) in filteredProcessIndices.enumerated() {
+                let rect = processListLayer.convert(CGRect(x: table.minX, y: table.maxY - CGFloat(index + 1) * rowHeight + processScroll,
+                    width: table.width, height: rowHeight), to: rootLayer)
+                guard rect.intersects(viewport) else { continue }
+                let process = processes[sourceIndex]
+                rows.append(accessibilityNode("process/\(process.pid)/\(process.command)", role: .row, frame: rect,
+                    label: process.name, value: "PID \(process.pid), \(process.command)", enabled: !isRecording,
+                    actions: [.press, .focus], selected: selectedPID == process.pid, focused: selectedPID == process.pid && !processSearchFocused && !perfPathInputController.isFocused, rowIndex: index) { owner, _, _ in
+                        owner.blurProcessSearch(); owner.blurPerfPath(commit: true)
+                        owner.selectedPID = process.pid
+                        owner.statusLayer.string = "Next recording target: \(process.name) (\(process.pid))."
+                        owner.updateColors()
+                    })
+            }
+            children.append(accessibilityNode("processes", role: .table, frame: viewport, label: "Processes", children: rows,
+                actions: [.scrollUp, .scrollDown], rowCount: filteredProcessIndices.count) { owner, action, _ in
+                    owner.processScroll += (action == .scrollDown ? 1 : -1) * owner.processViewportLayer.bounds.height * 0.8
+                    owner.clampProcessScroll(); owner.updateProcessScrollPosition()
+                })
+            children.append(accessibilityNode("perf-path", role: .textField, frame: processListLayer.convert(perfPathFrame, to: rootLayer),
+                label: "Path to perf executable", value: perfPathInputController.text, enabled: !isBusy && !isRecording,
+                actions: [.focus, .setValue], focused: perfPathInputController.isFocused) { owner, action, value in
+                    owner.focusPerfPath(cursorPosition: owner.perfPathInputController.text.count, modifySelection: false)
+                    if action == .setValue { owner.perfPathInputController.setText(value); owner.commitPerfPathInput() }
+                })
+            children.append(accessibilityNode("perf-select", role: .button, frame: processListLayer.convert(perfSelectFrame, to: rootLayer),
+                label: "Choose perf executable", enabled: !isBusy && !isRecording, actions: [.press]) { owner, _, _ in owner.openPerfFilePicker() })
+        } else if let profile = lastProfile {
+            let range = selectedRange ?? 0...Double(profile.duration)
+            let summary = "\(profile.totalSampleCount) samples, \(profile.cpuMilliseconds) milliseconds CPU, duration \(profile.duration) seconds. Selected \(range.lowerBound) to \(range.upperBound) seconds."
+            var rangeNodes: [OuterframeAccessibilityNode] = []
+            for isStart in [true, false] {
+                rangeNodes.append(accessibilityNode(isStart ? "range-start" : "range-end", role: .textField, frame: frame(timelineLayer),
+                    label: isStart ? "Selection start in seconds" : "Selection end in seconds", value: String(isStart ? range.lowerBound : range.upperBound),
+                    hint: "Enter seconds within the recording", actions: [.setValue]) { owner, _, value in
+                        guard let number = Double(value), number.isFinite, number >= 0, number <= Double(profile.duration) else { return }
+                        let current = owner.selectedRange ?? 0...Double(profile.duration)
+                        guard isStart ? number <= current.upperBound : number >= current.lowerBound else { return }
+                        owner.selectedRange = isStart ? number...current.upperBound : current.lowerBound...number
+                        owner.updateTimeline(); owner.fetchSelectedRange()
+                    })
+            }
+            children.append(accessibilityNode("timeline", role: .container, frame: frame(timelineLayer), label: "CPU usage timeline", value: summary, children: rangeNodes))
+            let viewport = frame(flameViewportLayer)
+            let boxes = flameLayerItems.enumerated().compactMap { index, item -> OuterframeAccessibilityNode? in
+                let rect = frame(item.boxLayer)
+                guard rect.intersects(viewport) else { return nil }
+                return accessibilityNode("flame/\(profile.profileID)/\(item.depth)/\(item.xFraction)/\(item.node.frame)", role: .row,
+                    frame: rect.intersection(viewport), label: item.node.frame.symbol,
+                    value: "\(item.node.frame.symbol), \(item.node.frame.binary), stack depth \(item.depth), \(item.node.count) samples, \(String(format: "%.1f", 100 * Double(item.node.count) / Double(max(flameTotalSamples, 1)))) percent")
+            }
+            children.append(accessibilityNode("flame", role: .scrollArea, frame: viewport, label: "Call stacks", value: "\(flameTotalSamples) samples. Stack depth identifies caller and callee levels.",
+                children: boxes, actions: [.scrollUp, .scrollDown]) { owner, action, _ in
+                    owner.flameVerticalScroll += (action == .scrollDown ? 1 : -1) * owner.flameViewportLayer.bounds.height * 0.8
+                    owner.clampFlameScroll(); owner.updateFlameScrollPosition()
+                })
+        }
+        return OuterframeAccessibilitySnapshot(rootNodes: [accessibilityNode("root", role: .container, frame: rootLayer.bounds, label: "Profile", children: children)])
+    }
+
     private func updateColors() {
+        defer { notifyAccessibilityChanged() }
         appearance.performAsCurrentDrawingAppearance {
             rootLayer.backgroundColor = pageBackgroundColor.cgColor
             toolbarLayer.backgroundColor = toolbarColor.cgColor
@@ -995,6 +1173,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     }
 
     private func updateLayout() {
+        defer { notifyAccessibilityChanged() }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         let width = max(currentSize.width, 1)
@@ -2131,6 +2310,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     }
 
     private func updateTraceScrollPosition() {
+        defer { notifyAccessibilityChanged() }
         guard traceViewportLayer.superlayer != nil else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -2667,6 +2847,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     }
 
     private func renderFilePicker() {
+        defer { notifyAccessibilityChanged() }
         appearance.performAsCurrentDrawingAppearance {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
@@ -3101,6 +3282,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     }
 
     private func updateProcessScrollPosition() {
+        defer { notifyAccessibilityChanged() }
         guard processViewportLayer.superlayer != nil else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -4404,6 +4586,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     }
 
     private func updateFlameScrollPosition() {
+        defer { notifyAccessibilityChanged() }
         guard flameLayer.superlayer != nil else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
