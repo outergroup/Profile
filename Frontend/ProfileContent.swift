@@ -838,6 +838,10 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         case .accessibilityAction(let identifier, let action, let value):
             performAccessibilityAction(identifier, action: action, value: value)
 
+        case .accessibilityActionAndSnapshot(let requestID, let identifier, let action, let value):
+            performAccessibilityAction(identifier, action: action, value: value)
+            outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID, snapshot: accessibilitySnapshot())
+
         case .accessibilitySnapshotRequest(let requestID):
             outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID, snapshot: accessibilitySnapshot())
 
@@ -984,13 +988,15 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                                    children: [OuterframeAccessibilityNode] = [], enabled: Bool = true,
                                    actions: OuterframeAccessibilityActions = [], selected: Bool = false,
                                    focused: Bool = false, rowIndex: Int? = nil, rowCount: Int? = nil,
+                                   disclosureLevel: Int = 0, expanded: Bool? = nil, minimum: Double? = nil, maximum: Double? = nil,
                                    handler: ((ProfileHandler, OuterframeAccessibilityAction, String) -> Void)? = nil) -> OuterframeAccessibilityNode {
         let id: UInt32
         if let existing = accessibilityIDs[key] { id = existing }
         else { id = UInt32(accessibilityIDs.count + 1); accessibilityIDs[key] = id }
         let node = OuterframeAccessibilityNode(identifier: id, role: role, frame: frame, label: label,
             value: value, hint: hint, children: children, rowCount: rowCount, isEnabled: enabled,
-            actions: actions, isFocused: focused, isSelected: selected, rowIndex: rowIndex)
+            actions: actions, isFocused: focused, isSelected: selected, rowIndex: rowIndex,
+            supportsActionSnapshot: true, isExpanded: expanded, disclosureLevel: disclosureLevel, minimumValue: minimum, maximumValue: maximum)
         accessibilityNodes[id] = node
         accessibilityActions[id] = handler
         return node
@@ -1035,7 +1041,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                 })
             children.append(accessibilityNode("picker-cancel", role: .button, frame: filePickerCancelFrame, label: "Cancel",
                 actions: [.press]) { owner, _, _ in owner.pendingFilePicker = nil; owner.renderFilePicker() })
-            return OuterframeAccessibilitySnapshot(rootNodes: [accessibilityNode("picker", role: .container,
+            return OuterframeAccessibilitySnapshot(rootNodes: [accessibilityNode("picker", role: .dialog,
                 frame: filePickerPanelFrame, label: "Choose perf executable", value: picker.path, children: children)])
         }
         var children = [accessibilityNode("status", role: .staticText, frame: frame(statusLayer), label: "Status", value: statusLayer.string as? String)]
@@ -1110,11 +1116,21 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             let summary = "\(profile.totalSampleCount) samples, \(profile.cpuMilliseconds) milliseconds CPU, duration \(profile.duration) seconds. Selected \(range.lowerBound) to \(range.upperBound) seconds."
             var rangeNodes: [OuterframeAccessibilityNode] = []
             for isStart in [true, false] {
-                rangeNodes.append(accessibilityNode(isStart ? "range-start" : "range-end", role: .textField, frame: frame(timelineLayer),
+                rangeNodes.append(accessibilityNode(isStart ? "range-start" : "range-end", role: .slider, frame: frame(timelineLayer),
                     label: isStart ? "Selection start in seconds" : "Selection end in seconds", value: String(isStart ? range.lowerBound : range.upperBound),
-                    hint: "Enter seconds within the recording", actions: [.setValue]) { owner, _, value in
-                        guard let number = Double(value), number.isFinite, number >= 0, number <= Double(profile.duration) else { return }
+                    hint: "Adjust the selected recording range", actions: [.setValue, .increment, .decrement],
+                    minimum: isStart ? 0 : range.lowerBound, maximum: isStart ? range.upperBound : Double(profile.duration)) { owner, action, value in
                         let current = owner.selectedRange ?? 0...Double(profile.duration)
+                        let number: Double
+                        if action == .setValue {
+                            guard let parsed = Double(value), parsed.isFinite else { return }
+                            number = parsed
+                        } else {
+                            let step = max(Double(profile.duration) / 100, 0.001)
+                            let proposed = (isStart ? current.lowerBound : current.upperBound) + (action == .increment ? step : -step)
+                            number = min(max(proposed, isStart ? 0 : current.lowerBound), isStart ? current.upperBound : Double(profile.duration))
+                        }
+                        guard number >= 0, number <= Double(profile.duration) else { return }
                         guard isStart ? number <= current.upperBound : number >= current.lowerBound else { return }
                         owner.selectedRange = isStart ? number...current.upperBound : current.lowerBound...number
                         owner.updateTimeline(); owner.fetchSelectedRange()
@@ -1122,14 +1138,24 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             }
             children.append(accessibilityNode("timeline", role: .container, frame: frame(timelineLayer), label: "CPU usage timeline", value: summary, children: rangeNodes))
             let viewport = frame(flameViewportLayer)
-            let boxes = flameLayerItems.enumerated().compactMap { index, item -> OuterframeAccessibilityNode? in
-                let rect = frame(item.boxLayer)
-                guard rect.intersects(viewport) else { return nil }
-                return accessibilityNode("flame/\(profile.profileID)/\(item.depth)/\(item.xFraction)/\(item.node.frame)", role: .row,
-                    frame: rect.intersection(viewport), label: item.node.frame.symbol,
-                    value: "\(item.node.frame.symbol), \(item.node.frame.binary), stack depth \(item.depth), \(item.node.count) samples, \(String(format: "%.1f", 100 * Double(item.node.count) / Double(max(flameTotalSamples, 1)))) percent")
+            var itemIndex = 0
+            func stackRows(at depth: Int) -> [OuterframeAccessibilityNode] {
+                var rows: [OuterframeAccessibilityNode] = []
+                while itemIndex < flameLayerItems.count, flameLayerItems[itemIndex].depth == depth {
+                    let item = flameLayerItems[itemIndex]
+                    itemIndex += 1
+                    let descendants = stackRows(at: depth + 1)
+                    let rect = frame(item.boxLayer).intersection(viewport)
+                    guard !rect.isNull || !descendants.isEmpty else { continue }
+                    rows.append(accessibilityNode("flame/\(profile.profileID)/\(item.depth)/\(item.xFraction)/\(item.node.frame)", role: .row,
+                        frame: rect.isNull ? .zero : rect, label: item.node.frame.symbol,
+                        value: "\(item.node.frame.binary), \(item.node.count) samples, \(String(format: "%.1f", 100 * Double(item.node.count) / Double(max(flameTotalSamples, 1)))) percent",
+                        children: descendants, disclosureLevel: depth, expanded: descendants.isEmpty ? nil : true))
+                }
+                return rows
             }
-            children.append(accessibilityNode("flame", role: .scrollArea, frame: viewport, label: "Call stacks", value: "\(flameTotalSamples) samples. Stack depth identifies caller and callee levels.",
+            let boxes = stackRows(at: 0)
+            children.append(accessibilityNode("flame", role: .outline, frame: viewport, label: "Call stacks", value: "\(flameTotalSamples) samples. Stack depth identifies caller and callee levels.",
                 children: boxes, actions: [.scrollUp, .scrollDown]) { owner, action, _ in
                     owner.flameVerticalScroll += (action == .scrollDown ? 1 : -1) * owner.flameViewportLayer.bounds.height * 0.8
                     owner.clampFlameScroll(); owner.updateFlameScrollPosition()
