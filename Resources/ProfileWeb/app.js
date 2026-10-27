@@ -187,7 +187,28 @@
     setSidebarOpen(false);
   }
 
+  let profileLoadGeneration = 0;
+  let restoredTraceURL = null;
+
+  function updateTraceURL(id) {
+    const url = new URL(location.href);
+    url.pathname = id ? `/traces/${id}` : '/';
+    url.hash = '';
+    if (url.href !== location.href) history.pushState(null, '', url);
+    restoredTraceURL = location.href;
+  }
+
+  function restoreTraceURL() {
+    if (restoredTraceURL === location.href) return;
+    restoredTraceURL = location.href;
+    const match = /^\/traces\/([1-9][0-9]*)$/.exec(location.pathname);
+    if (match && Number.isSafeInteger(Number(match[1]))) loadProfile(Number(match[1]));
+    else showSetup();
+  }
+
   function showSetup() {
+    profileLoadGeneration++;
+    updateTraceURL(null);
     state.showingSetup = true;
     state.selectedID = 0;
     $('#setupView').hidden = false;
@@ -345,7 +366,10 @@
   }
 
   async function loadProfile(id, start, end) {
+    const generation = ++profileLoadGeneration;
+    updateTraceURL(id);
     state.selectedID = Number(id);
+    if (state.profile?.id !== state.selectedID) clearProfileDisplay('Loading recording…');
     showProfile();
     setProfileStatus('Loading recording…');
     try {
@@ -356,12 +380,15 @@
       }
       const response = await fetch('/api/profile/range?' + query);
       if (!response.ok) throw Error(await response.text());
-      state.profile = parseProfile(await response.arrayBuffer());
+      const profile = parseProfile(await response.arrayBuffer());
+      if (generation !== profileLoadGeneration) return;
+      state.profile = profile;
       state.selectedID = state.profile.id;
       state.range = [state.profile.start, state.profile.end];
       renderRuns();
       renderProfile();
     } catch (error) {
+      if (generation !== profileLoadGeneration) return;
       setProfileStatus(error.message || 'Could not load recording.');
     }
   }
@@ -730,6 +757,7 @@
         if (!response.ok) throw Error(await response.text());
         state.profile = parseProfile(await response.arrayBuffer());
         state.selectedID = state.profile.id;
+        updateTraceURL(state.selectedID);
         state.recording = false;
         state.range = [state.profile.start, state.profile.end];
         renderProfile();
@@ -928,7 +956,8 @@
     }
   });
 
-  showSetup();
+  window.addEventListener('popstate', restoreTraceURL);
+  restoreTraceURL();
   Promise.all([refreshProcesses(), refreshPerf(), refreshRuns()]);
   setInterval(() => { if (state.recording) refreshRuns(); }, 1000);
 })();

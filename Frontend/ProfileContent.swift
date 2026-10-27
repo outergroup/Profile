@@ -584,6 +584,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     private var machineUnsupportedSelectionFocus: Int?
     private var isSelectingMachineUnsupportedText = false
     private var machineUnsupportedContextMenuIDs = Set<UUID>()
+    private var currentTraceURL: URL?
     private var showingSetup = true
     private var isBusy = false
     private var isRecording = false
@@ -591,6 +592,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     private var activeRecordingPID: Int?
     private var activeRecordingFrequency: Int?
     private var recordingStartedAt: Date?
+    private var profileRequestID = UUID()
     private var isFetchingRange = false
     private var lastProfile: ProfileResponse?
     private var selectedRange: ClosedRange<Double>?
@@ -659,9 +661,15 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             updateLayout()
             registerRootLayerIfNeeded()
             outerframeHost.setInputMode(.rawKeys)
-            fetchProfiles(selectLatestIfNeeded: true)
+            currentTraceURL = outerframeHost.pluginURL()
+            restoreTraceURL(currentTraceURL)
+            fetchProfiles()
             fetchProcesses()
             fetchPerfConfig()
+
+        case .historyTraversal(_, let url):
+            currentTraceURL = URL(string: url)
+            restoreTraceURL(currentTraceURL)
 
         case .resizeContent(let size):
             currentSize = size
@@ -1312,6 +1320,8 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
 
     private func handleSidebarClick(at point: CGPoint) {
         if nextRecordingFrame().contains(point) {
+            updateTraceURL(nil)
+            profileRequestID = UUID()
             showingSetup = true
             selectedTraceID = nil
             lastProfile = nil
@@ -1408,11 +1418,39 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         return CGRect(x: 10, y: y, width: traceViewportLayer.bounds.width - 20, height: runRowHeight - 8)
     }
 
+    private func updateTraceURL(_ id: UInt64?) {
+        guard let current = currentTraceURL,
+              var components = URLComponents(url: current, resolvingAgainstBaseURL: false) else { return }
+        components.path = id.map { "/traces/\($0)" } ?? "/"
+        components.fragment = nil
+        guard let url = components.url, url != current else { return }
+        currentTraceURL = url
+        outerframeHost.pushHistoryEntry(url: url)
+    }
+
+    private func restoreTraceURL(_ url: URL?) {
+        profileRequestID = UUID()
+        let parts = (url?.path ?? "").split(separator: "/")
+        let id = parts.count == 2 && parts[0] == "traces" ? UInt64(parts[1]) : nil
+        selectedTraceID = id.flatMap { $0 > 0 ? $0 : nil }
+        showingSetup = selectedTraceID == nil
+        lastProfile = nil
+        selectedRange = nil
+        resetFlameViewport()
+        if let selectedTraceID {
+            loadProfile(id: selectedTraceID)
+        } else {
+            statusLayer.string = "Choose a process for the next recording."
+        }
+        updateColors()
+    }
+
     private func selectTrace(at index: Int) {
         guard traces.indices.contains(index) else { return }
         blurProcessSearch()
         showingSetup = false
         selectedTraceID = traces[index].profileID
+        updateTraceURL(selectedTraceID)
         lastProfile = nil
         selectedRange = nil
         resetFlameViewport()
@@ -1845,7 +1883,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         CATransaction.commit()
     }
 
-    private func fetchProfiles(selectLatestIfNeeded: Bool) {
+    private func fetchProfiles() {
         guard let endpoint = profileListEndpoint, let urlSession else { return }
         urlSession.dataTask(with: endpoint) { [weak self] data, _, error in
             let result = data.flatMap(ProfileBinary.decodeProfileList)
@@ -1855,23 +1893,6 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                     self.traces = result.profiles
                     self.isRecording = result.recording
                     self.activeRecordingID = result.recording ? result.recordingID : nil
-                    if result.recording, self.selectedTraceID == nil {
-                        self.showingSetup = false
-                        self.selectedTraceID = result.recordingID
-                        self.lastProfile = nil
-                        self.selectedRange = nil
-                        self.statusLayer.string = "Recording..."
-                    } else if selectLatestIfNeeded, self.selectedTraceID == nil, let latest = result.profiles.last {
-                        self.showingSetup = false
-                        self.selectedTraceID = latest.profileID
-                        self.resetFlameViewport()
-                        self.loadProfile(id: latest.profileID)
-                    } else if let selectedTraceID = self.selectedTraceID,
-                              !self.traces.contains(where: { $0.profileID == selectedTraceID }) &&
-                              selectedTraceID != self.activeRecordingID {
-                        self.selectedTraceID = nil
-                        self.showingSetup = true
-                    }
                     self.updateColors()
                 } else {
                     self.statusLayer.string = error?.localizedDescription ?? "Could not load recordings."
@@ -2074,11 +2095,12 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                 if let decoded {
                     self.lastProfile = decoded
                     self.selectedTraceID = decoded.profileID
+                    self.updateTraceURL(decoded.profileID)
                     self.showingSetup = false
                     self.selectedRange = decoded.rangeStart...decoded.rangeEnd
                     self.resetFlameViewport()
                     self.statusLayer.string = self.summaryText(for: decoded)
-                    self.fetchProfiles(selectLatestIfNeeded: false)
+                    self.fetchProfiles()
                 } else {
                     self.statusLayer.string = error?.localizedDescription ?? "Stop failed (\(status)): \(body)"
                 }
@@ -2092,6 +2114,8 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         var components = URLComponents(url: profileRangeEndpoint, resolvingAgainstBaseURL: false)
         components?.queryItems = [URLQueryItem(name: "profileID", value: String(id))]
         guard let url = components?.url else { return }
+        let requestID = UUID()
+        profileRequestID = requestID
         isFetchingRange = true
         statusLayer.string = "Loading recording..."
         urlSession.dataTask(with: url) { [weak self] data, response, error in
@@ -2099,7 +2123,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.profileRequestID == requestID, !self.showingSetup else { return }
                 self.isFetchingRange = false
                 if let decoded {
                     self.lastProfile = decoded
@@ -2156,6 +2180,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
                     } else {
                         self.statusLayer.string = "Deleted recording."
                     }
+                    self.updateTraceURL(self.showingSetup ? nil : self.selectedTraceID)
                     self.updateColors()
                 } else {
                     self.statusLayer.string = error?.localizedDescription ?? "Delete failed (\(status)): \(body)"
@@ -2176,6 +2201,8 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             URLQueryItem(name: "end", value: String(format: "%.6f", selectedRange.upperBound))
         ]
         guard let url = components?.url else { return }
+        let requestID = UUID()
+        profileRequestID = requestID
         isFetchingRange = true
         statusLayer.string = "Filtering \(formatDuration(selectedRange.upperBound - selectedRange.lowerBound))..."
         urlSession.dataTask(with: url) { [weak self] data, response, error in
@@ -2183,7 +2210,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             let body = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.profileRequestID == requestID, !self.showingSetup else { return }
                 self.isFetchingRange = false
                 if let decoded {
                     self.lastProfile = decoded

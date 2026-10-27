@@ -11,6 +11,7 @@
 #include <limits.h>
 #include <math.h>
 #include <poll.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -735,6 +736,8 @@ static void profile_run_free(ProfileRun *run) {
     memset(run, 0, sizeof(*run));
 }
 
+#include "ProfileStorage.h"
+
 static ProfileRun *profile_store_find(uint64_t id) {
     for (size_t i = 0; i < g_profiles.count; i++) {
         if (g_profiles.items[i].id == id) return &g_profiles.items[i];
@@ -750,37 +753,36 @@ static ProfileRun *profile_store_latest(void) {
 static bool profile_store_delete(uint64_t id) {
     for (size_t i = 0; i < g_profiles.count; i++) {
         if (g_profiles.items[i].id != id) continue;
-        profile_run_free(&g_profiles.items[i]);
-        if (i + 1 < g_profiles.count) {
-            memmove(&g_profiles.items[i],
-                    &g_profiles.items[i + 1],
-                    (g_profiles.count - i - 1) * sizeof(ProfileRun));
-        }
+        ProfileRun removed = g_profiles.items[i];
+        memmove(&g_profiles.items[i], &g_profiles.items[i + 1], (g_profiles.count - i - 1) * sizeof(ProfileRun));
         g_profiles.count--;
+        if (!profile_store_save()) {
+            memmove(&g_profiles.items[i + 1], &g_profiles.items[i], (g_profiles.count - i) * sizeof(ProfileRun));
+            g_profiles.items[i] = removed;
+            g_profiles.count++;
+            return false;
+        }
+        profile_run_free(&removed);
         return true;
     }
     return false;
 }
 
 static bool profile_store_append(ProfileRun run) {
-    if (g_profiles.count == MAX_STORED_PROFILES) {
-        profile_run_free(&g_profiles.items[0]);
-        if (g_profiles.count > 1) {
-            memmove(&g_profiles.items[0],
-                    &g_profiles.items[1],
-                    (g_profiles.count - 1) * sizeof(ProfileRun));
-        }
-        g_profiles.count--;
-    }
     if (g_profiles.count == g_profiles.capacity) {
-        size_t new_capacity = g_profiles.capacity ? g_profiles.capacity * 2 : 8;
-        if (new_capacity > MAX_STORED_PROFILES) new_capacity = MAX_STORED_PROFILES;
-        ProfileRun *new_items = realloc(g_profiles.items, new_capacity * sizeof(ProfileRun));
-        if (!new_items) return false;
-        g_profiles.items = new_items;
-        g_profiles.capacity = new_capacity;
+        size_t capacity = g_profiles.count + 1;
+        ProfileRun *items = realloc(g_profiles.items, capacity * sizeof(ProfileRun));
+        if (!items) return false;
+        g_profiles.items = items;
+        g_profiles.capacity = capacity;
     }
     g_profiles.items[g_profiles.count++] = run;
+    if (!profile_store_save()) { g_profiles.count--; return false; }
+    if (g_profiles.count > MAX_STORED_PROFILES) {
+        profile_run_free(&g_profiles.items[0]);
+        g_profiles.count--;
+        memmove(g_profiles.items, g_profiles.items + 1, g_profiles.count * sizeof(ProfileRun));
+    }
     return true;
 }
 
@@ -1884,7 +1886,7 @@ static ProfileRun *install_completed_profile_run(ContainerContext container, uin
 
     ProfileRun run = {
         .container = container,
-        .id = requested_id ? requested_id : g_next_profile_id++,
+        .id = requested_id ? requested_id : profile_reserve_id(),
         .pid = pid,
         .duration = duration,
         .frequency = frequency,
@@ -1900,7 +1902,7 @@ static ProfileRun *install_completed_profile_run(ContainerContext container, uin
         .script_error = script_error,
         .samples = samples
     };
-    if (!run.status || !run.record_output || !run.script_error) {
+    if (!run.id || !run.status || !run.record_output || !run.script_error) {
         profile_run_free(&run);
         return NULL;
     }
@@ -2059,7 +2061,12 @@ static void send_profile_start(int fd, const char *query) {
 
     RecordingRun recording = {0};
     recording.active = true;
-    recording.id = g_next_profile_id++;
+    recording.id = profile_reserve_id();
+    if (!recording.id) {
+        cleanup_temp_dir(temp_dir);
+        send_text_response(fd, 500, "Could not reserve a durable recording ID. Check Profile storage.\n");
+        return;
+    }
     recording.pid = pid;
     recording.container = container_for_pid(pid);
     char expected_start[32], expected_container[128];
@@ -2253,12 +2260,27 @@ static void send_profile_delete(int fd, const char *query) {
         send_text_response(fd, 400, "invalid profileID\n");
         return;
     }
-    if (!profile_store_delete(profile_id)) {
+    if (!profile_store_find(profile_id)) {
         send_text_response(fd, 404, "profile not found\n");
+        return;
+    }
+    if (!profile_store_delete(profile_id)) {
+        send_text_response(fd, 500, "Could not save the recording deletion.\n");
         return;
     }
     send_profile_list_binary(fd, query && strstr(query, "containers=1"));
 #endif
+}
+
+static bool is_profile_document_path(const char *path) {
+    if (!strcmp(path, "/") || !strcmp(path, "/index.outer")) return true;
+    if (strncmp(path, "/traces/", 8) || path[8] < '1' || path[8] > '9') return false;
+    uint64_t id = 0;
+    for (const char *p = path + 8; *p; p++) {
+        if (*p < '0' || *p > '9' || id > (UINT64_MAX - (unsigned)(*p - '0')) / 10) return false;
+        id = id * 10 + (unsigned)(*p - '0');
+    }
+    return true;
 }
 
 static void handle_client(int fd) {
@@ -2283,7 +2305,7 @@ static void handle_client(int fd) {
 
     if (strcasecmp(method, "GET") != 0 && strcasecmp(method, "HEAD") != 0 && strcasecmp(method, "POST") != 0) {
         send_text_response(fd, 400, "unsupported method\n");
-    } else if (strcmp(target, "/") == 0 && !request_accepts_outerframe(buffer, request_header_length)) {
+    } else if (is_profile_document_path(target) && strcmp(target, "/index.outer") != 0 && !request_accepts_outerframe(buffer, request_header_length)) {
         send_web_file(fd, "index.html", "text/html; charset=utf-8", buffer, request_header_length,
                       !g_current_request_is_head);
     } else if (strcmp(target, "/web/app-icon.png") == 0 || strcmp(target, "/favicon.ico") == 0) {
@@ -2294,7 +2316,7 @@ static void handle_client(int fd) {
     } else if (strcmp(target, "/web/app.js") == 0) {
         send_web_file(fd, "app.js", "text/javascript; charset=utf-8", buffer, request_header_length,
                       !g_current_request_is_head);
-    } else if (strcmp(target, "/") == 0 || strcmp(target, "/index.outer") == 0) {
+    } else if (is_profile_document_path(target)) {
         send_outer_descriptor(fd, buffer, request_header_length, !g_current_request_is_head);
     } else if (strcmp(target, kBundleUrlPath) == 0) {
         send_text_response(fd, 200, "macos-arm\nmacos-x86\n");
@@ -2401,7 +2423,7 @@ static int systemd_activated_listener(void) {
 }
 
 static void print_usage(const char *program) {
-    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--label LABEL] [--bundles-dir DIR] [--web-root DIR]\n", program);
+    fprintf(stderr, "Usage: %s [--port PORT | --socket-path PATH] [--label LABEL] [--bundles-dir DIR] [--web-root DIR] [--state-dir DIR]\n", program);
 }
 
 int main(int argc, char **argv) {
@@ -2409,6 +2431,7 @@ int main(int argc, char **argv) {
     int port = 0;
     const char *bundles_dir = "bundles";
     char socket_path[PATH_MAX] = "";
+    char state_dir[PATH_MAX] = "";
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -2419,6 +2442,8 @@ int main(int argc, char **argv) {
             snprintf(g_backend_label, sizeof(g_backend_label), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--bundles-dir") == 0 && i + 1 < argc) {
             bundles_dir = argv[++i];
+        } else if (strcmp(argv[i], "--state-dir") == 0 && i + 1 < argc) {
+            snprintf(state_dir, sizeof(state_dir), "%s", argv[++i]);
         } else if (strcmp(argv[i], "--web-root") == 0 && i + 1 < argc) {
             snprintf(g_web_root, sizeof(g_web_root), "%s", argv[++i]);
         } else if ((strcmp(argv[i], "--api-socket-path") == 0 || strcmp(argv[i], "--icon-file") == 0) && i + 1 < argc) {
@@ -2430,6 +2455,24 @@ int main(int argc, char **argv) {
             print_usage(argv[0]);
             return 2;
         }
+    }
+
+    if (!state_dir[0]) {
+        const char *service = getenv("OUTERSHELL_SERVICE_STATE_DIR");
+        const char *xdg = getenv("XDG_STATE_HOME");
+        const char *home = getenv("HOME");
+        struct passwd *pw = home && home[0] ? NULL : getpwuid(getuid());
+        if (pw) home = pw->pw_dir;
+        int length;
+        if (service && service[0]) length = snprintf(state_dir, sizeof(state_dir), "%s", service);
+        else if (xdg && xdg[0]) length = snprintf(state_dir, sizeof(state_dir), "%s/%s", xdg, g_backend_label);
+        else if (home && home[0]) length = snprintf(state_dir, sizeof(state_dir), "%s/.local/state/%s", home, g_backend_label);
+        else { fprintf(stderr, "No home or state directory configured.\n"); return 1; }
+        if (length >= (int)sizeof(state_dir)) { fprintf(stderr, "State directory path is too long.\n"); return 1; }
+    }
+    if (!profile_store_open(state_dir)) {
+        fprintf(stderr, "Could not load Profile recordings from %s; refusing to overwrite them.\n", state_dir);
+        return 1;
     }
 
     snprintf(g_bundle_file_path_macos_arm, sizeof(g_bundle_file_path_macos_arm), "%s/%s", bundles_dir, kBundleFilePathMacosArm);

@@ -1,6 +1,22 @@
 # Profile
 
-Profile is a minimal outerframe app for browsing a directory over the same backend-backed shape as the other quick Outer Loop prototypes. The first version intentionally keeps the UI small: it lists the current home directory, supports scroll/selection, opens folders, and exposes enough pasteboard capability surface to start iterating on drag-and-drop download/upload behavior.
+Profile records Linux perf stack samples and displays CPU timelines and flame graphs through HTML and outerframe frontends.
+
+## Recording URLs and storage
+
+Both frontends use `/traces/<recording-id>` for trace pages and `/` for Next Recording. The backend serves HTML or the outerframe descriptor at each document path according to the request's Accept header. Selecting a trace adds browser history; reloads and history navigation restore that trace.
+
+Completed recordings, including original sample timestamps, stack frames, container metadata, and capture diagnostics, are stored in a versioned offset-based binary file named `recordings.bin`. Writes use a temporary file, fsync, and atomic rename. A lock prevents two backends from writing the same store. Invalid or unsupported stores cause startup to fail without overwriting them.
+
+Storage uses `--state-dir DIR` when supplied, otherwise `OUTERSHELL_SERVICE_STATE_DIR`, `$XDG_STATE_HOME/<label>`, or `$HOME/.local/state/<label>`. Keep this directory outside deployment bundles. The existing 32-recording retention limit also applies to saved recordings; deletion and eviction persist across restarts. Recording IDs are reserved durably and never reused after deletion or restart. An in-progress capture is not a completed recording and does not survive backend termination.
+
+To run the storage and routing regression tests:
+
+```sh
+cc -std=gnu17 -g -fsanitize=address,undefined Scripts/test_profile_storage.c -o /tmp/test-profile-storage -lm -pthread
+/tmp/test-profile-storage
+node Scripts/test_trace_navigation.cjs
+```
 
 ## Build
 
