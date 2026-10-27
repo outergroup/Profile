@@ -236,20 +236,17 @@ aside {
 .flame-wrap { display: grid; grid-template-rows: 31px minmax(0, 1fr); min-width: 0; min-height: 0; padding: 0 18px 18px; }
 .flame-wrap > div:first-child { padding: 6px 0; color: var(--muted); font-size: 13px; line-height: 16px; }
 #flameViewport { overflow: auto; min-width: 0; max-width: 100%; min-height: 0; overscroll-behavior: contain; touch-action: pan-x pan-y; scrollbar-gutter: stable; }
-#flameViewport.pinching { overflow-y: hidden; }
-#flame { position: relative; min-height: 100%; transform-origin: 0 0; }
-.frame { position: absolute; height: 29px; border: .5px solid #0002; padding: 0; overflow: hidden; color: white; cursor: default; container-type: inline-size; }
-.frame b, .frame small { position: absolute; display: block; left: 5px; right: 5px; overflow: hidden; text-overflow: clip; white-space: nowrap; }
-.frame b { top: 3px; height: 13px; font-size: 11px; font-weight: 500; line-height: 13px; }
-.frame small { top: 15px; height: 11px; opacity: .68; font-size: 9px; line-height: 11px; }
-.frame.single b { top: 7px; }
-@container (max-width: 53px) {
-  .frame small { display: none; }
-  .frame b { top: 7px; }
-}
-@container (max-width: 33px) {
-  .frame b, .frame small { display: none; }
-}
+#flame { position: relative; min-height: 100%; overflow: clip; }
+.flame-boxes { position: absolute; left: 0; top: 0; height: 100%; transform-origin: 0 0; contain: layout style; }
+.frame { position: absolute; height: 29px; border-bottom: .5px solid #0002; pointer-events: none; }
+.flame-labels { position: absolute; left: 0; top: 0; pointer-events: none; }
+.flame-label { position: absolute; left: 0; top: 0; height: 29px; overflow: hidden; color: white; contain: layout paint style; }
+.flame-label b, .flame-label small { position: absolute; display: block; left: 5px; white-space: nowrap; }
+.flame-label b { top: 3px; font-size: 11px; font-weight: 500; line-height: 13px; }
+.flame-label small { top: 15px; opacity: .68; font-size: 9px; line-height: 11px; }
+.flame-label.single b { top: 7px; }
+.flame-label.single small { display: none; }
+.flame-label:focus-visible { outline: 2px solid white; outline-offset: -2px; }
 
 dialog {
   width: min(620px, calc(100vw - 32px));
@@ -280,7 +277,7 @@ dialog::backdrop { background: #0005; }
   :root { --bg: #1d1d1d; --side: #202020; --text: #e8e8e8; --muted: #999; --line: #444; --stripe: #262626; --field: #202020; }
 }
 
-@media (max-width: 950px), (hover: none) and (pointer: coarse) {
+@media (max-width: 950px) {
   main { grid-template-columns: 1fr; }
   aside {
     position: fixed;

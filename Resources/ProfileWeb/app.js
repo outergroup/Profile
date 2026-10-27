@@ -16,7 +16,6 @@
     flameSource: null,
     flameDepth: 0,
     pinch: null,
-    pinchEndTimer: null,
     drag: null,
     showingSetup: true,
     perf: { path: '/usr/bin/perf', usable: true, message: '', machineUnsupported: false },
@@ -391,6 +390,14 @@
     $('#shadeRight').style.width = '0%';
     $('#rangeLabel').textContent = message;
     $('#flameTitle').textContent = '';
+    clearTimeout(flameView.settleTimer);
+    flameView.settleTimer = null;
+    cancelAnimationFrame(flameView.frame);
+    flameView.frame = 0;
+    flameView.rows = [];
+    flameView.active.clear();
+    flameView.pool = [];
+    flameView.boxes = flameView.labels = null;
     $('#flame').replaceChildren();
   }
 
@@ -448,45 +455,169 @@
     return `hsl(${Math.abs(hash) % 360} 30% 53%)`;
   }
 
+  const flameView = { rows: [], boxes: null, labels: null, active: new Map(), pool: [], width: 0, height: 0,
+    left: 0, top: 0, frame: 0, zoomDirty: false, boxZoom: 1, commitDirty: false, settleTimer: null };
+
+  function firstFlameItem(row, fraction) {
+    let low = 0, high = row.length;
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (row[mid].x + row[mid].width <= fraction) low = mid + 1;
+      else high = mid;
+    }
+    return low;
+  }
+
   function rebuildFlame() {
+    clearTimeout(flameView.settleTimer);
+    flameView.settleTimer = null;
     const root = tree();
     const items = [];
+    flameView.rows = [];
     function walk(node, x, width, depth) {
       let cursor = x;
       const children = [...node.children.values()].sort((a, b) => b.count - a.count || a.frame.symbol.localeCompare(b.frame.symbol));
       for (const child of children) {
         const childWidth = width * child.count / Math.max(1, node.count);
-        items.push({ node: child, x: cursor, width: childWidth, depth });
+        const item = { node: child, x: cursor, width: childWidth, depth, id: items.length };
+        items.push(item);
+        (flameView.rows[depth] ||= []).push(item);
         walk(child, cursor, childWidth, depth + 1);
         cursor += childWidth;
       }
     }
     walk(root, 0, 1, 0);
-    const flame = $('#flame');
     state.flameSource = state.profile;
-    state.flameDepth = Math.max(0, ...items.map(item => item.depth)) + 1;
-    flame.replaceChildren(...items.map(item => {
+    state.flameDepth = flameView.rows.length;
+    flameView.active.clear();
+    flameView.pool = [];
+    flameView.boxes = document.createElement('div');
+    flameView.boxes.className = 'flame-boxes';
+    flameView.boxes.setAttribute('aria-hidden', 'true');
+    flameView.labels = document.createElement('div');
+    flameView.labels.className = 'flame-labels';
+    flameView.boxes.replaceChildren(...items.map(item => {
       const element = document.createElement('div');
-      element.className = 'frame' + (item.node.frame.binary ? '' : ' single');
-      element.style.left = item.x * 100 + '%';
-      element.style.width = item.width * 100 + '%';
+      element.className = 'frame';
       element.style.top = item.depth * 31 + 'px';
       element.style.background = color(item.node.frame.binary || item.node.frame.symbol);
-      element.innerHTML = '<b></b><small></small>';
-      element.firstChild.textContent = item.node.frame.symbol;
-      element.lastChild.textContent = item.node.frame.binary;
-      element.title = `${item.node.frame.symbol}\n${item.node.frame.binary}\n${item.node.count} samples`;
-      element.ondblclick = () => zoomAt(item.x + item.width / 2, 2);
+      item.box = element;
       return element;
     }));
+    $('#flame').replaceChildren(flameView.boxes, flameView.labels);
+    flameView.width = 0;
+  }
+
+  function updateFlameLabels() {
+    const width = flameView.width * state.zoom;
+    const firstDepth = Math.max(0, Math.floor(flameView.top / 31));
+    const lastDepth = Math.min(flameView.rows.length, Math.ceil((flameView.top + flameView.height) / 31));
+    const visible = [];
+    for (let depth = firstDepth; depth < lastDepth; depth++) {
+      const row = flameView.rows[depth];
+      for (let index = firstFlameItem(row, flameView.left / width); index < row.length; index++) {
+        const item = row[index];
+        const left = item.x * width;
+        if (left >= flameView.left + flameView.width) break;
+        const right = Math.min(left + item.width * width, flameView.left + flameView.width);
+        const clippedLeft = Math.max(left, flameView.left);
+        if (right - clippedLeft >= 34) visible.push({ item, left: clippedLeft, width: right - clippedLeft });
+      }
+    }
+    const ids = new Set(visible.map(entry => entry.item.id));
+    for (const [id, label] of flameView.active) {
+      if (!ids.has(id)) {
+        label.remove();
+        flameView.active.delete(id);
+        flameView.pool.push(label);
+      }
+    }
+    for (const entry of visible) {
+      const { item } = entry;
+      let label = flameView.active.get(item.id);
+      if (!label) {
+        label = flameView.pool.pop() || document.createElement('div');
+        label.className = 'flame-label';
+        label.innerHTML = '<b></b><small></small>';
+        label.firstChild.textContent = item.node.frame.symbol;
+        label.lastChild.textContent = item.node.frame.binary;
+        label.tabIndex = 0;
+        label.setAttribute('role', 'button');
+        label.setAttribute('aria-label', `${item.node.frame.symbol}, ${item.node.frame.binary}, ${item.node.count} samples. Zoom in`);
+        label.onkeydown = event => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            zoomAt(item.x + item.width / 2, 2);
+          }
+        };
+        flameView.labels.append(label);
+        flameView.active.set(item.id, label);
+      }
+      label.classList.toggle('single', !item.node.frame.binary || entry.width < 54);
+      label.style.transform = `translate(${entry.left}px, ${item.depth * 31}px)`;
+      label.style.width = entry.width + 'px';
+    }
+  }
+
+  function commitFlameBoxes() {
+    const width = flameView.width * state.zoom;
+    flameView.boxes.style.width = width + 'px';
+    for (const row of flameView.rows) for (const item of row) {
+      item.box.style.left = item.x * width + 'px';
+      item.box.style.width = item.width * width + 'px';
+    }
+    flameView.boxZoom = state.zoom;
+    flameView.boxes.style.transform = 'none';
+    flameView.boxes.style.willChange = 'auto';
+    flameView.commitDirty = false;
+  }
+
+  function settleFlameZoom() {
+    clearTimeout(flameView.settleTimer);
+    flameView.settleTimer = null;
+    flameView.commitDirty = true;
+    scheduleFlameView();
+  }
+
+  function applyFlameView() {
+    flameView.frame = 0;
+    if (!state.profile || !flameView.boxes || !flameView.width) return;
+    const viewport = $('#flameViewport');
+    const width = flameView.width * state.zoom;
+    if (flameView.commitDirty) commitFlameBoxes();
+    if (flameView.zoomDirty) {
+      flameView.left = Math.max(0, Math.min(width - flameView.width, flameView.left));
+      $('#flame').style.width = width + 'px';
+      const scale = state.zoom / flameView.boxZoom;
+      flameView.boxes.style.willChange = scale === 1 ? 'auto' : 'transform';
+      flameView.boxes.style.transform = scale === 1 ? 'none' : `scaleX(${scale})`;
+      viewport.scrollLeft = flameView.left;
+      $('#zoomReset').textContent = Math.round(state.zoom * 100) + '%';
+      flameView.zoomDirty = false;
+    }
+    updateFlameLabels();
+  }
+
+  function scheduleFlameView() {
+    if (!flameView.frame) flameView.frame = requestAnimationFrame(applyFlameView);
   }
 
   function layoutFlame() {
     if (!state.profile) return;
     const viewport = $('#flameViewport');
-    const flame = $('#flame');
-    flame.style.width = Math.max(1, state.zoom * viewport.clientWidth) + 'px';
-    flame.style.height = Math.max(viewport.clientHeight, state.flameDepth * 31) + 'px';
+    const width = viewport.clientWidth;
+    const height = viewport.clientHeight;
+    if (width !== flameView.width) {
+      const fraction = flameView.width ? flameView.left / (flameView.width * state.zoom) : 0;
+      flameView.width = width;
+      flameView.left = fraction * width * state.zoom;
+      flameView.commitDirty = true;
+    }
+    flameView.height = height;
+    flameView.top = viewport.scrollTop;
+    $('#flame').style.height = Math.max(height, state.flameDepth * 31) + 'px';
+    flameView.zoomDirty = true;
+    scheduleFlameView();
   }
 
   function renderFlame() {
@@ -496,36 +627,33 @@
   }
 
   function setZoom(zoom, anchorFraction, anchorX) {
-    if (!state.profile) return;
-    const viewport = $('#flameViewport');
-    const localX = anchorX == null ? viewport.clientWidth / 2 : anchorX;
-    const contentFraction = anchorFraction == null
-      ? (viewport.scrollLeft + localX) / (viewport.scrollWidth || 1)
-      : anchorFraction;
-    state.zoom = Math.max(1, Math.min(16, zoom));
-    layoutFlame();
-    viewport.scrollLeft = Math.max(0, contentFraction * viewport.scrollWidth - localX);
-    $('#zoomReset').textContent = Math.round(state.zoom * 100) + '%';
+    if (!state.profile || !flameView.width) return;
+    const localX = anchorX == null ? flameView.width / 2 : anchorX;
+    const fraction = anchorFraction == null ? (flameView.left + localX) / (flameView.width * state.zoom) : anchorFraction;
+    if (!Number.isFinite(zoom) || !Number.isFinite(zoom * flameView.width)) return;
+    state.zoom = Math.max(1, zoom);
+    flameView.left = Math.max(0, Math.min(flameView.width * (state.zoom - 1), fraction * flameView.width * state.zoom - localX));
+    flameView.zoomDirty = true;
+    $('#flameViewport').removeAttribute('title');
+    clearTimeout(flameView.settleTimer);
+    flameView.settleTimer = state.pinch ? null : setTimeout(settleFlameZoom, 180);
+    scheduleFlameView();
   }
 
   function zoomAt(factor, multiplier) {
-    if (!state.profile) return;
-    const viewport = $('#flameViewport');
-    setZoom(state.zoom * multiplier, factor, viewport.clientWidth / 2);
+    setZoom(state.zoom * multiplier, factor, flameView.width / 2);
   }
 
   function flameAnchor(clientX) {
-    const viewport = $('#flameViewport');
-    const rect = viewport.getBoundingClientRect();
-    const proposed = Number.isFinite(clientX) ? clientX - rect.left : viewport.clientWidth / 2;
-    const x = Math.max(0, Math.min(viewport.clientWidth, proposed));
-    return { x, fraction: (viewport.scrollLeft + x) / (viewport.scrollWidth || 1) };
+    const rect = $('#flameViewport').getBoundingClientRect();
+    const proposed = Number.isFinite(clientX) ? clientX - rect.left : flameView.width / 2;
+    const x = Math.max(0, Math.min(flameView.width, proposed));
+    return { x, fraction: (flameView.left + x) / Math.max(1, flameView.width * state.zoom) };
   }
 
   function beginPinch(clientX, distance = 1) {
-    clearTimeout(state.pinchEndTimer);
-    state.pinchEndTimer = null;
-    $('#flameViewport').classList.add('pinching');
+    clearTimeout(flameView.settleTimer);
+    flameView.settleTimer = null;
     const anchor = flameAnchor(clientX);
     state.pinch = { zoom: state.zoom, anchor: anchor.fraction, x: anchor.x, distance };
   }
@@ -537,11 +665,18 @@
 
   function endPinch() {
     state.pinch = null;
-    clearTimeout(state.pinchEndTimer);
-    state.pinchEndTimer = setTimeout(() => {
-      $('#flameViewport').classList.remove('pinching');
-      state.pinchEndTimer = null;
-    }, 180);
+    settleFlameZoom();
+  }
+
+  function flameItemAt(clientX, clientY) {
+    const viewport = $('#flameViewport');
+    const rect = viewport.getBoundingClientRect();
+    const depth = Math.floor((clientY - rect.top + viewport.scrollTop) / 31);
+    const row = flameView.rows[depth];
+    if (!row) return null;
+    const x = (clientX - rect.left + flameView.left) / (flameView.width * state.zoom);
+    const item = row[firstFlameItem(row, x)];
+    return item && item.x <= x ? item : null;
   }
 
   function formatTime(value) {
@@ -723,6 +858,21 @@
     setZoom(1, 0, 0);
   };
   const flameViewport = $('#flameViewport');
+  flameViewport.addEventListener('scroll', () => {
+    if (!flameView.zoomDirty) flameView.left = Math.max(0, flameViewport.scrollLeft);
+    flameView.top = Math.max(0, flameViewport.scrollTop);
+    scheduleFlameView();
+  }, { passive: true });
+  flameViewport.addEventListener('dblclick', event => {
+    const item = flameItemAt(event.clientX, event.clientY);
+    if (item) zoomAt(item.x + item.width / 2, 2);
+  });
+  flameViewport.addEventListener('pointermove', event => {
+    if (state.pinch || event.pointerType === 'touch') return;
+    const item = flameItemAt(event.clientX, event.clientY);
+    flameViewport.title = item ? `${item.node.frame.symbol}\n${item.node.frame.binary}\n${item.node.count} samples` : '';
+  });
+
   flameViewport.addEventListener('wheel', event => {
     if (event.ctrlKey || event.metaKey) {
       event.preventDefault();

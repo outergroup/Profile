@@ -1775,8 +1775,9 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         guard viewport.contains(flamePoint) else { return }
 
         let oldZoom = flameZoom
-        let newZoom = min(max(oldZoom * (1 + magnification), 1), 16)
-        guard abs(newZoom - oldZoom) > 0.001 else { return }
+        let newZoom = max(oldZoom * (1 + magnification), 1)
+        guard newZoom.isFinite, (viewport.width * newZoom).isFinite,
+              abs(newZoom - oldZoom) > 0.001 else { return }
 
         let localX = flamePoint.x - viewport.minX
         let contentX = flameHorizontalScroll + localX
@@ -4805,8 +4806,6 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         flameVerticalScroll = min(max(flameVerticalScroll, 0), maxVertical)
         if flameZoom < 1 {
             flameZoom = 1
-        } else if flameZoom > 16 {
-            flameZoom = 16
         }
     }
 
