@@ -67,6 +67,7 @@ package_linux_variant() {
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_root}/app-icon.png"
     mkdir -p "${app_root}/web"
     install -m 0644 "${REPO_ROOT}/Resources/ProfileWeb/index.html" "${app_root}/web/index.html"
+    install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_root}/web/app-icon.png"
     install -m 0644 "${REPO_ROOT}/Resources/ProfileWeb/app.css" "${app_root}/web/app.css"
     install -m 0644 "${REPO_ROOT}/Resources/ProfileWeb/app.js" "${app_root}/web/app.js"
     tar --format ustar --no-xattrs -C "${STAGING_ROOT}" -czf "${OUTPUT_APP_ROOT}/${output_name}.tar.gz" Profile

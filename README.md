@@ -72,3 +72,11 @@ To test a deployed remote host with curl:
 ```bash
 ssh "$HOST" 'curl --unix-socket "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/org.outershell.Profile" http://localhost/'
 ```
+
+## Container-aware HTML view
+
+On Linux, the process picker groups host-visible processes by Docker container using cgroups and Outer Shell's binary registry API. It displays container-local PIDs while recording against host PIDs. The HTML client supplies the selected process's start time and container identity; the backend rejects a stale selection before starting perf. Discovery runs in a background thread and refreshes every five seconds.
+
+Recordings retain their container identity, name, and local PID. `perf record --namespaces` records namespace information so perf can resolve binaries inside the target's filesystem. Symbols still depend on permissions, available binaries/debug information, and the installed perf version. Existing perf permission requirements apply; the app does not grant container capabilities or elevate itself. This path supports host-visible Linux containers, not containers inside another VM/kernel.
+
+The extended process and recording-list binary responses are requested with `containers=1`; outerframe responses retain their original layout. Run `python3 Scripts/test_container_processes.py` to check the backend and actual JavaScript decoder. Passing an output filename exports a Linux response fixture for decoding on a development machine with Node.

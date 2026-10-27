@@ -49,12 +49,16 @@
     const count = u32(view, 16);
     const offset = u32(view, 20);
     return Array.from({ length: count }, (_, index) => {
-      const row = offset + index * 24;
+      const row = offset + index * 56;
       return {
         pid: i32(view, row),
         ppid: i32(view, row + 4),
         name: stringAt(buffer, view, row + 8),
-        command: stringAt(buffer, view, row + 16)
+        command: stringAt(buffer, view, row + 16),
+        container: stringAt(buffer, view, row + 24),
+        containerID: stringAt(buffer, view, row + 32),
+        localPID: i32(view, row + 40),
+        startTime: u64(view, row + 48)
       };
     });
   }
@@ -67,7 +71,7 @@
       recording: Boolean(u32(view, 16)),
       active: u64(view, 20),
       runs: Array.from({ length: count }, (_, index) => {
-        const row = offset + index * 48;
+        const row = offset + index * 72;
         return {
           id: u64(view, row),
           pid: i32(view, row + 8),
@@ -75,7 +79,10 @@
           samples: u32(view, row + 16),
           duration: f64(view, row + 24),
           cpu: f64(view, row + 32),
-          status: stringAt(buffer, view, row + 40)
+          status: stringAt(buffer, view, row + 40),
+          container: stringAt(buffer, view, row + 48),
+          containerID: stringAt(buffer, view, row + 56),
+          localPID: i32(view, row + 64)
         };
       })
     };
@@ -205,7 +212,7 @@
   function setupStatusText() {
     if (state.recording) return `Recording pid ${state.selectedPID} at 1000 Hz…`;
     const process = selectedProcess();
-    if (process) return `Next recording target: ${process.name} (${process.pid}).`;
+    if (process) return `Next recording target: ${process.name} (${process.localPID || process.pid}) · ${process.container}.`;
     if (!state.perf.usable && state.perf.message) return state.perf.message;
     return 'Choose a process for the next recording.';
   }
@@ -218,7 +225,7 @@
       button.setAttribute('aria-label', state.recording ? 'Stop recording' : 'Start recording');
     }
     $('#sidebarTarget').textContent = selectedProcess()
-      ? `${selectedProcess().name} (${state.selectedPID})`
+      ? `${selectedProcess().container} · ${selectedProcess().name} (${selectedProcess().localPID || state.selectedPID})`
       : 'Choose a target';
     if (state.showingSetup) setSetupStatus(setupStatusText());
   }
@@ -229,10 +236,16 @@
     $('#refreshProcesses').textContent = 'Refreshing…';
     setSetupStatus('Refreshing processes…');
     try {
-      const response = await fetch('/api/processes');
+      const response = await fetch('/api/processes?containers=1');
       if (!response.ok) throw Error(await response.text());
+      const previousStart = selectedProcess()?.startTime;
       state.processes = parseProcesses(await response.arrayBuffer());
-      if (state.selectedPID && !selectedProcess()) state.selectedPID = 0;
+      const picker = $('#container');
+      const selected = picker.value;
+      const environments = new Map(state.processes.map(process => [process.containerID, process.container]));
+      picker.replaceChildren(new Option('All containers and host', ''), ...[...environments].map(([id, name]) => new Option(name, id)));
+      if (environments.has(selected)) picker.value = selected;
+      if (state.selectedPID && (!selectedProcess() || selectedProcess().startTime !== previousStart)) state.selectedPID = 0;
       renderProcesses();
       updateRecordingControls();
     } catch (error) {
@@ -246,8 +259,9 @@
   function renderProcesses() {
     const query = $('#processSearch').value.trim().toLowerCase();
     const matches = state.processes.filter(process =>
+      (!$('#container').value || process.containerID === $('#container').value) && (
       !query || process.name.toLowerCase().includes(query) ||
-      process.command.toLowerCase().includes(query) || String(process.pid).includes(query)
+      process.command.toLowerCase().includes(query) || String(process.pid).includes(query) || String(process.localPID).includes(query) || process.container.toLowerCase().includes(query))
     ).slice(0, 1000);
     if (!matches.length) {
       const empty = document.createElement('div');
@@ -261,10 +275,10 @@
       row.className = 'process-row' + (process.pid === state.selectedPID ? ' selected' : '');
       row.setAttribute('role', 'option');
       row.setAttribute('aria-selected', process.pid === state.selectedPID ? 'true' : 'false');
-      row.title = process.command || process.name;
+      row.title = `${process.container} · host PID ${process.pid}\n${process.command || process.name}`;
       row.innerHTML = '<span class="pid"></span><span class="name"></span>';
-      row.firstChild.textContent = process.pid;
-      row.lastChild.textContent = process.name;
+      row.firstChild.textContent = process.localPID || process.pid;
+      row.lastChild.textContent = $('#container').value ? process.name : `${process.name} — ${process.container}`;
       row.onclick = () => {
         state.selectedPID = process.pid;
         renderProcesses();
@@ -295,7 +309,7 @@
 
   async function refreshRuns() {
     try {
-      const response = await fetch('/api/profiles');
+      const response = await fetch('/api/profiles?containers=1');
       if (!response.ok) throw Error(await response.text());
       const result = parseRuns(await response.arrayBuffer());
       state.recording = result.recording;
@@ -324,7 +338,7 @@
       row.className = 'trace' + (!state.showingSetup && run.id === state.selectedID ? ' selected' : '');
       row.innerHTML = '<strong></strong><small></small>';
       row.firstChild.textContent = `Run ${state.runs.length - index}`;
-      row.lastChild.textContent = `pid ${run.pid}  ${run.duration.toFixed(2)} s`;
+      row.lastChild.textContent = `${run.container} · pid ${run.localPID || run.pid} · ${run.duration.toFixed(2)} s`;
       row.onclick = () => loadProfile(run.id);
       return row;
     }));
@@ -604,6 +618,8 @@
 
     const query = new URLSearchParams({
       pid: state.selectedPID,
+      startTime: selectedProcess()?.startTime || 0,
+      container: selectedProcess()?.containerID || "unknown",
       frequency: 1000,
       perfPath: $('#perfPath').value.trim()
     });
@@ -689,6 +705,7 @@
   });
   $('#refreshProcesses').onclick = refreshProcesses;
   $('#processSearch').oninput = renderProcesses;
+  $('#container').onchange = () => { state.selectedPID = 0; renderProcesses(); updateRecordingControls(); };
   $('#record').onclick = toggleRecording;
   $('#recordProfile').onclick = toggleRecording;
   $('#perfPath').onchange = () => refreshPerf($('#perfPath').value.trim());

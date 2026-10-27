@@ -398,3 +398,5 @@ dialog::backdrop { background: #0005; }
 @media (prefers-reduced-motion: reduce) {
   aside, .drawer-scrim { transition: none; }
 }
+
+#container { font: inherit; color: inherit; background: var(--field, var(--button)); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; max-width: 240px; min-width: 0; }

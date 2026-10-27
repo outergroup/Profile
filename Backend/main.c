@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include "HTTPCache.h"
+#include "ContainerContext.h"
 #ifdef __linux__
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
@@ -134,6 +135,7 @@ typedef struct {
     char *record_output;
     char *script_error;
     StackSamples samples;
+    ContainerContext container;
 } ProfileRun;
 
 typedef struct {
@@ -157,6 +159,7 @@ typedef struct {
     uint64_t cpu_ticks_before;
     bool have_cpu_ticks_before;
     double start_time;
+    ContainerContext container;
 } RecordingRun;
 
 typedef struct {
@@ -1506,7 +1509,7 @@ static bool send_binary_builder(int fd, StringBuilder *binary) {
     return true;
 }
 
-static void send_processes_binary(int fd) {
+static void send_processes_binary(int fd, bool containers) {
     ProcessList list = {0};
     if (!collect_processes(&list)) {
         send_text_response(fd, 500, "failed to list processes\n");
@@ -1514,7 +1517,7 @@ static void send_processes_binary(int fd) {
     }
 
     const uint32_t header_size = 32;
-    const uint32_t row_size = 24;
+    const uint32_t row_size = containers ? 56 : 24;
     uint32_t rows_offset = header_size;
     uint32_t strings_offset = rows_offset + (uint32_t)list.count * row_size;
     BinaryStringTable string_table = {.base_offset = strings_offset};
@@ -1532,6 +1535,16 @@ static void send_processes_binary(int fd) {
              sb_append_u32(&rows, name_length) &&
              sb_append_u32(&rows, command_offset) &&
              sb_append_u32(&rows, command_length);
+        if (ok && containers) {
+            ContainerContext context = container_for_pid(row->pid);
+            uint32_t name_offset, name_length, id_offset, id_length;
+            ok = binary_add_string(&string_table, context.name, &name_offset, &name_length) &&
+                 binary_add_string(&string_table, context.id, &id_offset, &id_length) &&
+                 sb_append_u32(&rows, name_offset) && sb_append_u32(&rows, name_length) &&
+                 sb_append_u32(&rows, id_offset) && sb_append_u32(&rows, id_length) &&
+                 sb_append_i32(&rows, context.local_pid) && sb_append_u32(&rows, 0) &&
+                 sb_append_u64(&rows, container_process_start(row->pid));
+        }
     }
 
     StringBuilder binary = {0};
@@ -1572,12 +1585,12 @@ static void send_recording_binary(int fd, bool recording, uint64_t recording_id,
     send_binary_builder(fd, &binary);
 }
 
-static void send_profile_list_binary(int fd) {
+static void send_profile_list_binary(int fd, bool containers) {
 #ifndef __linux__
     send_text_response(fd, 500, "Linux perf profiling is only available on Linux.\n");
 #else
     const uint32_t header_size = 48;
-    const uint32_t row_size = 48;
+    const uint32_t row_size = containers ? 72 : 48;
     uint32_t rows_offset = header_size;
     uint32_t strings_offset = rows_offset + (uint32_t)g_profiles.count * row_size;
     BinaryStringTable string_table = {.base_offset = strings_offset};
@@ -1599,6 +1612,14 @@ static void send_profile_list_binary(int fd) {
              sb_append_f64(&rows, run->have_cpu_milliseconds ? run->cpu_milliseconds : -1.0) &&
              sb_append_u32(&rows, status_offset) &&
              sb_append_u32(&rows, status_length);
+        if (ok && containers) {
+            uint32_t name_offset, name_length, id_offset, id_length;
+            ok = binary_add_string(&string_table, run->container.name, &name_offset, &name_length) &&
+                 binary_add_string(&string_table, run->container.id, &id_offset, &id_length) &&
+                 sb_append_u32(&rows, name_offset) && sb_append_u32(&rows, name_length) &&
+                 sb_append_u32(&rows, id_offset) && sb_append_u32(&rows, id_length) &&
+                 sb_append_i32(&rows, run->container.local_pid) && sb_append_u32(&rows, 0);
+        }
     }
 
     StringBuilder binary = {0};
@@ -1779,7 +1800,7 @@ static bool aggregate_samples_in_range(const StackSamples *samples,
     return ok;
 }
 
-static ProfileRun *install_completed_profile_run(uint64_t requested_id,
+static ProfileRun *install_completed_profile_run(ContainerContext container, uint64_t requested_id,
                                           int pid,
                                           int duration,
                                           int frequency,
@@ -1862,6 +1883,7 @@ static ProfileRun *install_completed_profile_run(uint64_t requested_id,
     }
 
     ProfileRun run = {
+        .container = container,
         .id = requested_id ? requested_id : g_next_profile_id++,
         .pid = pid,
         .duration = duration,
@@ -1927,6 +1949,7 @@ static void send_profile_capture(int fd, const char *query) {
         send_text_response(fd, 500, "failed to create temp directory\n");
         return;
     }
+    ContainerContext container = container_for_pid(pid);
     char perf_data[PATH_MAX], record_log[PATH_MAX], script_text[PATH_MAX], script_err[PATH_MAX];
     snprintf(perf_data, sizeof(perf_data), "%s/perf.data", temp_dir);
     snprintf(record_log, sizeof(record_log), "%s/record.log", temp_dir);
@@ -1940,7 +1963,7 @@ static void send_profile_capture(int fd, const char *query) {
 
     char command[PATH_MAX * 4];
     snprintf(command, sizeof(command),
-             "'%s' record -e cpu-clock -F %d -g --call-graph fp -p %d -o '%s' -- sleep %d > '%s' 2>&1",
+             "'%s' record --namespaces -e cpu-clock -F %d -g --call-graph fp -p %d -o '%s' -- sleep %d > '%s' 2>&1",
              perf, frequency, pid, perf_data, duration, record_log);
     int record_status = system(command);
     double profile_end_time = monotonic_seconds();
@@ -1963,7 +1986,7 @@ static void send_profile_capture(int fd, const char *query) {
     char *record_output = read_whole_file_or_empty(record_log);
     char *script_error = read_whole_file_or_empty(script_err);
 
-    ProfileRun *run = install_completed_profile_run(0,
+    ProfileRun *run = install_completed_profile_run(container, 0,
                                                     pid,
                                                     duration,
                                                     frequency,
@@ -2038,6 +2061,16 @@ static void send_profile_start(int fd, const char *query) {
     recording.active = true;
     recording.id = g_next_profile_id++;
     recording.pid = pid;
+    recording.container = container_for_pid(pid);
+    char expected_start[32], expected_container[128];
+    if ((query_value(query, "startTime", expected_start, sizeof(expected_start)) &&
+         strtoull(expected_start, NULL, 10) != container_process_start(pid)) ||
+        (query_value(query, "container", expected_container, sizeof(expected_container)) &&
+         strcmp(expected_container, recording.container.id))) {
+        cleanup_temp_dir(temp_dir);
+        send_text_response(fd, 409, "The selected process has exited or changed. Refresh the process list.\n");
+        return;
+    }
     recording.frequency = frequency;
     recording.start_time = monotonic_seconds();
     recording.have_cpu_ticks_before = read_process_cpu_ticks(pid, &recording.cpu_ticks_before);
@@ -2077,6 +2110,7 @@ static void send_profile_start(int fd, const char *query) {
         execlp(recording.perf_path,
                recording.perf_path,
                "record",
+               "--namespaces",
                "-e", "cpu-clock",
                "-F", frequency_text,
                "-g",
@@ -2149,7 +2183,7 @@ static void send_profile_stop(int fd) {
     int duration = (int)ceil(profile_end_time - recording.start_time);
     if (duration < 1) duration = 1;
 
-    ProfileRun *run = install_completed_profile_run(recording.id,
+    ProfileRun *run = install_completed_profile_run(recording.container, recording.id,
                                                     recording.pid,
                                                     duration,
                                                     recording.frequency,
@@ -2223,7 +2257,7 @@ static void send_profile_delete(int fd, const char *query) {
         send_text_response(fd, 404, "profile not found\n");
         return;
     }
-    send_profile_list_binary(fd);
+    send_profile_list_binary(fd, query && strstr(query, "containers=1"));
 #endif
 }
 
@@ -2252,6 +2286,8 @@ static void handle_client(int fd) {
     } else if (strcmp(target, "/") == 0 && !request_accepts_outerframe(buffer, request_header_length)) {
         send_web_file(fd, "index.html", "text/html; charset=utf-8", buffer, request_header_length,
                       !g_current_request_is_head);
+    } else if (strcmp(target, "/web/app-icon.png") == 0 || strcmp(target, "/favicon.ico") == 0) {
+        send_web_file(fd, "app-icon.png", "image/png", buffer, request_header_length, !g_current_request_is_head);
     } else if (strcmp(target, "/web/app.css") == 0) {
         send_web_file(fd, "app.css", "text/css; charset=utf-8", buffer, request_header_length,
                       !g_current_request_is_head);
@@ -2269,7 +2305,7 @@ static void handle_client(int fd) {
         send_bundle_file(fd, g_bundle_file_path_macos_x86,
                          buffer, request_header_length, !g_current_request_is_head);
     } else if (strcmp(target, "/api/processes") == 0) {
-        send_processes_binary(fd);
+        send_processes_binary(fd, query && strstr(query, "containers=1"));
     } else if (strcmp(target, "/api/profile") == 0) {
         send_profile_capture(fd, query ? query : "");
     } else if (strcmp(target, "/api/profile/start") == 0) {
@@ -2279,7 +2315,7 @@ static void handle_client(int fd) {
     } else if (strcmp(target, "/api/profile/status") == 0) {
         send_recording_status(fd);
     } else if (strcmp(target, "/api/profiles") == 0) {
-        send_profile_list_binary(fd);
+        send_profile_list_binary(fd, query && strstr(query, "containers=1"));
     } else if (strcmp(target, "/api/profile/range") == 0) {
         send_profile_range(fd, query ? query : "");
     } else if (strcmp(target, "/api/profile/delete") == 0) {
@@ -2369,6 +2405,7 @@ static void print_usage(const char *program) {
 }
 
 int main(int argc, char **argv) {
+    container_start();
     int port = 0;
     const char *bundles_dir = "bundles";
     char socket_path[PATH_MAX] = "";
