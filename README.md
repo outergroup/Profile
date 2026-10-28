@@ -96,3 +96,45 @@ On Linux, the process picker groups host-visible processes by Docker container u
 Recordings retain their container identity, name, and local PID. `perf record --namespaces` records namespace information so perf can resolve binaries inside the target's filesystem. Symbols still depend on permissions, available binaries/debug information, and the installed perf version. Existing perf permission requirements apply; the app does not grant container capabilities or elevate itself. This path supports host-visible Linux containers, not containers inside another VM/kernel.
 
 The extended process and recording-list binary responses are requested with `containers=1`; outerframe responses retain their original layout. Run `python3 Scripts/test_container_processes.py` to check the backend and actual JavaScript decoder. Passing an output filename exports a Linux response fixture for decoding on a development machine with Node.
+
+## macOS container tracing
+
+The user app supports registered Docker and Apple Container targets. The Mac
+backend never traces macOS. The landing page chooses a runtime or an Apple
+container; target paths are retained in HTML and outerframe navigation.
+
+Docker uses an app-owned Linux worker with explicit tracing capabilities and
+access to the VM PID namespace. Only containers in Outer Shell's binary registry
+are eligible, and expired registry snapshots fail closed. No Docker socket is
+mounted in the worker. It starts on first use and stops with the Mac backend.
+
+Apple Container runs the app's own Linux helper inside the selected container.
+The helper stays alive while the backend uses it and exits when its stdin closes.
+Requests and responses use the existing binary app APIs in offset-based TRPC
+frames over `container exec --interactive`; there is no JSON helper protocol.
+The registry, rather than CLI container listings, supplies targets.
+
+Build and install with `./app deploy --local`. Xcode and either Docker or Apple
+Container are needed to build the Linux helper. Set
+`OUTER_BUILD_CONTAINER_RUNTIME=container|docker` to choose the builder. The app
+packages its helper under `Contents/Resources/helpers`, and Outer Shell's
+container bootstrap includes it in new base images. Existing images need their
+helper installed at `/usr/local/bin/outer-profile-helper` and rebuilt.
+Docker worker images are built during installation when Docker is available, or
+on first Docker use otherwise.
+
+Profile also requires `perf` in the target image and permission to sample its
+processes. In-container sampling omits namespace events so Apple Container's
+default capabilities suffice with its standard kernel settings. A live recording has been
+verified against Apple Container 1.1.0's standard Linux 6.18.15 kernel. Apple
+recordings live in `/root/.local/state/outer-profile-helper`; mount that directory
+as persistent storage to retain recordings across rebuilds. Docker recordings
+remain in the Mac app's private state directory.
+
+The runtime contract reserves `wslc` separately from WSL distributions (`wsl`).
+Windows process spawning and live tracing remain to be implemented and tested on
+Windows; the Mac implementation is not a Windows app.
+
+Run `python3 Scripts/test_macos_container_app.py` after installation to verify
+Docker APIs, host exclusion, HTML and favicon. The portable frame codec test is
+`cc -std=gnu17 Scripts/test_tracing_stream.c -o /tmp/test-stream && /tmp/test-stream`.

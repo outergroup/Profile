@@ -1,6 +1,8 @@
 (() => {
   'use strict';
 
+  const appFetch = (path, options) => window.fetch((location.pathname.match(/^\/targets\/[^/]+/)?.[0] || '') + path, options);
+
   const $ = selector => document.querySelector(selector);
   const decoder = new TextDecoder();
   const state = {
@@ -192,7 +194,7 @@
 
   function updateTraceURL(id) {
     const url = new URL(location.href);
-    url.pathname = id ? `/traces/${id}` : '/';
+    url.pathname = (location.pathname.match(/^\/targets\/[^/]+/)?.[0] || '') + (id ? `/traces/${id}` : '/');
     url.hash = '';
     if (url.href !== location.href) history.pushState(null, '', url);
     restoredTraceURL = location.href;
@@ -201,7 +203,7 @@
   function restoreTraceURL() {
     if (restoredTraceURL === location.href) return;
     restoredTraceURL = location.href;
-    const match = /^\/traces\/([1-9][0-9]*)$/.exec(location.pathname);
+    const match = /^\/traces\/([1-9][0-9]*)$/.exec(location.pathname.replace(/^\/targets\/[^/]+/, ''));
     if (match && Number.isSafeInteger(Number(match[1]))) loadProfile(Number(match[1]));
     else showSetup();
   }
@@ -256,14 +258,16 @@
     $('#refreshProcesses').textContent = 'Refreshing…';
     setSetupStatus('Refreshing processes…');
     try {
-      const response = await fetch('/api/processes?containers=1');
+      const capabilities = await appFetch('/api/capabilities');
+      const containerOnly = capabilities.ok && new Uint8Array(await capabilities.arrayBuffer())[0] === 1;
+      const response = await appFetch('/api/processes?containers=1');
       if (!response.ok) throw Error(await response.text());
       const previousStart = selectedProcess()?.startTime;
       state.processes = parseProcesses(await response.arrayBuffer());
       const picker = $('#container');
       const selected = picker.value;
       const environments = new Map(state.processes.map(process => [process.containerID, process.container]));
-      picker.replaceChildren(new Option('All containers and host', ''), ...[...environments].map(([id, name]) => new Option(name, id)));
+      picker.replaceChildren(new Option(containerOnly ? 'All containers' : 'All containers and host', ''), ...[...environments].map(([id, name]) => new Option(name, id)));
       if (environments.has(selected)) picker.value = selected;
       if (state.selectedPID && (!selectedProcess() || selectedProcess().startTime !== previousStart)) state.selectedPID = 0;
       renderProcesses();
@@ -295,7 +299,7 @@
       row.className = 'process-row' + (process.pid === state.selectedPID ? ' selected' : '');
       row.setAttribute('role', 'option');
       row.setAttribute('aria-selected', process.pid === state.selectedPID ? 'true' : 'false');
-      row.title = `${process.container} · host PID ${process.pid}\n${process.command || process.name}`;
+      row.title = `${process.container} · tracing PID ${process.pid}\n${process.command || process.name}`;
       row.innerHTML = '<span class="pid"></span><span class="name"></span>';
       row.firstChild.textContent = process.localPID || process.pid;
       row.lastChild.textContent = $('#container').value ? process.name : `${process.name} — ${process.container}`;
@@ -312,7 +316,7 @@
     const query = path == null ? '' : '?' + new URLSearchParams({ path });
     if (path != null) setSetupStatus('Checking perf…');
     try {
-      const response = await fetch('/api/perf' + query);
+      const response = await appFetch('/api/perf' + query);
       if (!response.ok) throw Error(await response.text());
       state.perf = parsePerf(await response.arrayBuffer());
       if (document.activeElement !== $('#perfPath')) $('#perfPath').value = state.perf.path;
@@ -329,7 +333,7 @@
 
   async function refreshRuns() {
     try {
-      const response = await fetch('/api/profiles?containers=1');
+      const response = await appFetch('/api/profiles?containers=1');
       if (!response.ok) throw Error(await response.text());
       const result = parseRuns(await response.arrayBuffer());
       state.recording = result.recording;
@@ -378,7 +382,7 @@
         query.set('start', start);
         query.set('end', end);
       }
-      const response = await fetch('/api/profile/range?' + query);
+      const response = await appFetch('/api/profile/range?' + query);
       if (!response.ok) throw Error(await response.text());
       const profile = parseProfile(await response.arrayBuffer());
       if (generation !== profileLoadGeneration) return;
@@ -753,7 +757,7 @@
       showProfile();
       setProfileStatus('Stopping recording and building profile…');
       try {
-        const response = await fetch('/api/profile/stop');
+        const response = await appFetch('/api/profile/stop');
         if (!response.ok) throw Error(await response.text());
         state.profile = parseProfile(await response.arrayBuffer());
         state.selectedID = state.profile.id;
@@ -788,7 +792,7 @@
     });
     setSetupStatus(`Starting recording for pid ${state.selectedPID}…`);
     try {
-      const response = await fetch('/api/profile/start?' + query);
+      const response = await appFetch('/api/profile/start?' + query);
       if (!response.ok) throw Error(await response.text());
       state.recording = true;
       state.selectedID = 0;
@@ -817,7 +821,7 @@
     $('#pickerPath').textContent = path;
     $('#pickerEntries').replaceChildren(Object.assign(document.createElement('div'), { className: 'empty-row', textContent: 'Loading…' }));
     try {
-      const response = await fetch('/api/file-picker?' + new URLSearchParams({ path }));
+      const response = await appFetch('/api/file-picker?' + new URLSearchParams({ path }));
       if (!response.ok) throw Error(await response.text());
       state.picker = parseFilePicker(await response.arrayBuffer());
       state.pickerSelection = null;

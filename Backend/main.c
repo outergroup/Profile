@@ -29,6 +29,7 @@
 
 #include "HTTPCache.h"
 #include "ContainerContext.h"
+#include "TracingStream.h"
 #ifdef __linux__
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
@@ -595,6 +596,7 @@ static bool collect_processes(ProcessList *list) {
         if (!isdigit((unsigned char)entry->d_name[0])) continue;
         int pid = atoi(entry->d_name);
         if (pid <= 0) continue;
+        if (container_only() && (!container_selected().id[0] && strlen(container_for_pid(pid).id)!=64)) continue;
         char stat_path[PATH_MAX];
         snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
         char *stat_text = read_text_file(stat_path, 4096);
@@ -1925,6 +1927,10 @@ static void send_profile_capture(int fd, const char *query) {
         return;
     }
     int pid = atoi(value);
+    if (container_only() && (!container_selected().id[0] && strlen(container_for_pid(pid).id)!=64)) {
+        send_text_response(fd, 403, "Only registered container processes can be profiled.\n");
+        return;
+    }
     if (pid <= 0) {
         send_text_response(fd, 400, "invalid pid\n");
         return;
@@ -1965,8 +1971,9 @@ static void send_profile_capture(int fd, const char *query) {
 
     char command[PATH_MAX * 4];
     snprintf(command, sizeof(command),
-             "'%s' record --namespaces -e cpu-clock -F %d -g --call-graph fp -p %d -o '%s' -- sleep %d > '%s' 2>&1",
-             perf, frequency, pid, perf_data, duration, record_log);
+             "'%s' record %s -e cpu-clock -F %d -g --call-graph fp -p %d -o '%s' -- sleep %d > '%s' 2>&1",
+             perf, container_selected().id[0] ? "--no-namespaces" : "--namespaces",
+             frequency, pid, perf_data, duration, record_log);
     int record_status = system(command);
     double profile_end_time = monotonic_seconds();
     bool have_cpu_ticks_after = read_process_cpu_ticks(pid, &cpu_ticks_after);
@@ -2039,6 +2046,10 @@ static void send_profile_start(int fd, const char *query) {
         return;
     }
     int pid = atoi(value);
+    if (container_only() && (!container_selected().id[0] && strlen(container_for_pid(pid).id)!=64)) {
+        send_text_response(fd, 403, "Only registered container processes can be profiled.\n");
+        return;
+    }
     if (pid <= 0) {
         send_text_response(fd, 400, "invalid pid\n");
         return;
@@ -2069,7 +2080,7 @@ static void send_profile_start(int fd, const char *query) {
     }
     recording.pid = pid;
     recording.container = container_for_pid(pid);
-    char expected_start[32], expected_container[128];
+    char expected_start[32], expected_container[sizeof(recording.container.id)];
     if ((query_value(query, "startTime", expected_start, sizeof(expected_start)) &&
          strtoull(expected_start, NULL, 10) != container_process_start(pid)) ||
         (query_value(query, "container", expected_container, sizeof(expected_container)) &&
@@ -2117,7 +2128,7 @@ static void send_profile_start(int fd, const char *query) {
         execlp(recording.perf_path,
                recording.perf_path,
                "record",
-               "--namespaces",
+               container_selected().id[0] ? "--no-namespaces" : "--namespaces",
                "-e", "cpu-clock",
                "-F", frequency_text,
                "-g",
@@ -2326,6 +2337,9 @@ static void handle_client(int fd) {
     } else if (strcmp(target, kBundleUrlPathMacosX86) == 0) {
         send_bundle_file(fd, g_bundle_file_path_macos_x86,
                          buffer, request_header_length, !g_current_request_is_head);
+    } else if (strcmp(target, "/api/capabilities") == 0) {
+        unsigned char flags[4]={container_only()?1:0,0,0,0};
+        send_response(fd,200,"OK","application/octet-stream",flags,sizeof(flags));
     } else if (strcmp(target, "/api/processes") == 0) {
         send_processes_binary(fd, query && strstr(query, "containers=1"));
     } else if (strcmp(target, "/api/profile") == 0) {
@@ -2364,7 +2378,7 @@ static int make_tcp_listener(int port) {
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_addr.s_addr = htonl(container_only() ? INADDR_ANY : INADDR_LOOPBACK);
     address.sin_port = htons((uint16_t)port);
     if (bind(fd, (struct sockaddr *)&address, sizeof(address)) != 0 || listen(fd, 64) != 0) {
         close(fd);
@@ -2427,6 +2441,9 @@ static void print_usage(const char *program) {
 }
 
 int main(int argc, char **argv) {
+#ifdef __linux__
+    if (argc == 2 && !strcmp(argv[1], "serve")) return tracing_serve(argv[0], "Profile");
+#endif
     container_start();
     int port = 0;
     const char *bundles_dir = "bundles";

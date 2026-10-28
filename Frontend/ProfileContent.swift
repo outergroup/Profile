@@ -58,6 +58,9 @@ private struct ProfileProcess {
     let ppid: Int
     let name: String
     let command: String
+    let containerID: String
+    let startTime: UInt64
+
 }
 
 private struct PerfConfigResponse {
@@ -307,7 +310,7 @@ private enum ProfileBinary {
               let rowsOffset = reader.u32(at: 20) else { return nil }
         var processes: [ProfileProcess] = []
         for index in 0..<Int(count) {
-            let row = Int(rowsOffset) + index * 24
+            let row = Int(rowsOffset) + index * 56
             guard let pid = reader.i32(at: row),
                   let ppid = reader.i32(at: row + 4),
                   let nameOffset = reader.u32(at: row + 8),
@@ -316,7 +319,16 @@ private enum ProfileBinary {
                   let commandLength = reader.u32(at: row + 20),
                   let name = reader.string(offset: nameOffset, length: nameLength),
                   let command = reader.string(offset: commandOffset, length: commandLength) else { return nil }
-            processes.append(ProfileProcess(pid: Int(pid), ppid: Int(ppid), name: name, command: command))
+            guard let containerOffset = reader.u32(at: row + 24),
+                  let containerLength = reader.u32(at: row + 28),
+                  let container = reader.string(offset: containerOffset, length: containerLength),
+                  let idOffset = reader.u32(at: row + 32),
+                  let idLength = reader.u32(at: row + 36),
+                  let containerID = reader.string(offset: idOffset, length: idLength),
+                  let startTime = reader.u64(at: row + 48) else { return nil }
+            let displayName = containerID == "host" ? name : "\(name) — \(container)"
+            processes.append(ProfileProcess(pid: Int(pid), ppid: Int(ppid), name: displayName, command: command,
+                                            containerID: containerID, startTime: startTime))
         }
         return ProcessListResponse(processes: processes)
     }
@@ -867,14 +879,17 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
 
     private func configureNetworking() {
         guard let base = outerframeHost.pluginBaseURL() else { return }
-        processesEndpoint = URL(string: "/api/processes", relativeTo: base)?.absoluteURL
-        profileStartEndpoint = URL(string: "/api/profile/start", relativeTo: base)?.absoluteURL
-        profileStopEndpoint = URL(string: "/api/profile/stop", relativeTo: base)?.absoluteURL
-        profileListEndpoint = URL(string: "/api/profiles", relativeTo: base)?.absoluteURL
-        profileRangeEndpoint = URL(string: "/api/profile/range", relativeTo: base)?.absoluteURL
-        profileDeleteEndpoint = URL(string: "/api/profile/delete", relativeTo: base)?.absoluteURL
-        perfEndpoint = URL(string: "/api/perf", relativeTo: base)?.absoluteURL
-        filePickerEndpoint = URL(string: "/api/file-picker", relativeTo: base)?.absoluteURL
+        let targetParts = (outerframeHost.pluginURL()?.path ?? "").split(separator: "/")
+        let targetPrefix = targetParts.count >= 2 && targetParts[0] == "targets" ? "/targets/\(targetParts[1])" : ""
+
+        processesEndpoint = URL(string: targetPrefix + "/api/processes", relativeTo: base)?.absoluteURL
+        profileStartEndpoint = URL(string: targetPrefix + "/api/profile/start", relativeTo: base)?.absoluteURL
+        profileStopEndpoint = URL(string: targetPrefix + "/api/profile/stop", relativeTo: base)?.absoluteURL
+        profileListEndpoint = URL(string: targetPrefix + "/api/profiles", relativeTo: base)?.absoluteURL
+        profileRangeEndpoint = URL(string: targetPrefix + "/api/profile/range", relativeTo: base)?.absoluteURL
+        profileDeleteEndpoint = URL(string: targetPrefix + "/api/profile/delete", relativeTo: base)?.absoluteURL
+        perfEndpoint = URL(string: targetPrefix + "/api/perf", relativeTo: base)?.absoluteURL
+        filePickerEndpoint = URL(string: targetPrefix + "/api/file-picker", relativeTo: base)?.absoluteURL
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 180
         configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
@@ -1421,7 +1436,9 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     private func updateTraceURL(_ id: UInt64?) {
         guard let current = currentTraceURL,
               var components = URLComponents(url: current, resolvingAgainstBaseURL: false) else { return }
-        components.path = id.map { "/traces/\($0)" } ?? "/"
+        let parts = components.path.split(separator: "/")
+        let prefix = parts.count >= 2 && parts[0] == "targets" ? "/targets/\(parts[1])" : ""
+        components.path = prefix + (id.map { "/traces/\($0)" } ?? "/")
         components.fragment = nil
         guard let url = components.url, url != current else { return }
         currentTraceURL = url
@@ -1430,7 +1447,8 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
 
     private func restoreTraceURL(_ url: URL?) {
         profileRequestID = UUID()
-        let parts = (url?.path ?? "").split(separator: "/")
+        var parts = (url?.path ?? "").split(separator: "/")
+        if parts.count >= 2 && parts[0] == "targets" { parts.removeFirst(2) }
         let id = parts.count == 2 && parts[0] == "traces" ? UInt64(parts[1]) : nil
         selectedTraceID = id.flatMap { $0 > 0 ? $0 : nil }
         showingSetup = selectedTraceID == nil
@@ -1903,8 +1921,11 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
 
     private func fetchProcesses() {
         guard let endpoint = processesEndpoint, let urlSession else { return }
+        var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [URLQueryItem(name: "containers", value: "1")]
+        guard let url = components?.url else { return }
         statusLayer.string = "Loading processes..."
-        urlSession.dataTask(with: endpoint) { [weak self] data, _, error in
+        urlSession.dataTask(with: url) { [weak self] data, _, error in
             let result = data.flatMap(ProfileBinary.decodeProcesses)
             Task { @MainActor in
                 guard let self else { return }
@@ -2035,10 +2056,13 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
 
     private func startRecording() {
         guard !isRecording, perfUsable, !perfMachineUnsupported, let selectedPID, let profileStartEndpoint, let urlSession else { return }
+        guard let process = processes.first(where: { $0.pid == selectedPID }) else { return }
         commitPerfPathInput()
         var components = URLComponents(url: profileStartEndpoint, resolvingAgainstBaseURL: false)
         components?.queryItems = [
             URLQueryItem(name: "pid", value: String(selectedPID)),
+            URLQueryItem(name: "container", value: process.containerID),
+            URLQueryItem(name: "startTime", value: String(process.startTime)),
             URLQueryItem(name: "frequency", value: "1000"),
             URLQueryItem(name: "perfPath", value: perfPathInputController.text.trimmingCharacters(in: .whitespacesAndNewlines))
         ]

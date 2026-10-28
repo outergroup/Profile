@@ -11,8 +11,10 @@ BUILD_DIR="${ROOT}/build/app-deploy"
 STAGE_PARENT="${BUILD_DIR}/stage"
 STAGE_ROOT="${STAGE_PARENT}/${APP_STAGE_NAME}"
 FRONTEND_BUILD_DIR="${BUILD_DIR}/frontend"
+LOCAL_BACKEND_BUILD_DIR="${BUILD_DIR}/local-backend"
 MATRIX_ROOT="${ROOT}/build/linux-package"
 TARGET_KIND=ssh
+TARGET_OVERRIDE_KIND=""
 SSH_BASE=()
 TARGET_OS=""
 TARGET_ARCH=""
@@ -96,16 +98,24 @@ shell_quote() {
 }
 
 load_target() {
+    if [[ "${TARGET_OVERRIDE_KIND}" == local ]]; then
+        TARGET_KIND=local
+        return
+    fi
     if [[ ! -f "${ROOT}/target.env" ]]; then
         echo "error: no deploy target configured" >&2
+        echo "  ./app target local" >&2
         echo "  ./app target \"ssh -p 22 you@server\"" >&2
         exit 1
     fi
     # shellcheck source=/dev/null
     source "${ROOT}/target.env"
     TARGET_KIND="${OUTER_TARGET_KIND:-ssh}"
+    if [[ "${TARGET_KIND}" == local ]]; then
+        return
+    fi
     if [[ "${TARGET_KIND}" != ssh ]]; then
-        echo "error: official bundled-app deployment currently requires an SSH target" >&2
+        echo "error: OUTER_TARGET_KIND must be local or ssh" >&2
         exit 1
     fi
     if [[ "$(declare -p OUTER_TARGET_SSH 2>/dev/null)" != declare\ -a* ]] ||
@@ -133,6 +143,21 @@ run_ssh() {
 
 probe_target() {
     load_target
+    if [[ "${TARGET_KIND}" == local ]]; then
+        TARGET_OS="$(uname -s)"
+        TARGET_ARCH="$(uname -m)"
+        TARGET_UID="$(id -u)"
+        TARGET_HOME="${HOME}"
+        if [[ "${TARGET_OS}" != Darwin ]]; then
+            echo "error: local bundled-app deployment currently requires macOS" >&2
+            exit 1
+        fi
+        case "${TARGET_ARCH}" in
+            arm64|x86_64) ;;
+            *) echo "error: unsupported local architecture '${TARGET_ARCH}'" >&2; exit 1 ;;
+        esac
+        return
+    fi
     TARGET_OS="$(run_ssh uname -s </dev/null)"
     TARGET_ARCH="$(run_ssh uname -m </dev/null)"
     TARGET_UID="$(run_ssh id -u </dev/null)"
@@ -156,6 +181,10 @@ probe_target() {
 target_scope() {
     local scope="${OUTER_TARGET_SCOPE:-${DEFAULT_DEPLOY_SCOPE:-user}}"
     if [[ "${TARGET_UID}" == 0 ]]; then scope=system; fi
+    if [[ "${TARGET_KIND}" == local && "${scope}" != user ]]; then
+        echo "error: macOS container tracing must be installed for the container owner, not root" >&2
+        exit 1
+    fi
     if [[ "${scope}" != user && "${scope}" != system ]]; then
         echo "error: OUTER_TARGET_SCOPE must be user or system" >&2
         exit 1
@@ -196,8 +225,47 @@ cmd_build_frontend() {
         "${bundle}" \
         "${STAGE_ROOT}/bundles" \
         "${BUNDLE_ARCHIVE_STEM}"
-    install -m 0644 "${ROOT}/app-icon.png" "${STAGE_ROOT}/app-icon.png"
     install -m 0644 "${ROOT}/Resources/ProfileWeb/index.html" "${ROOT}/Resources/ProfileWeb/app.css" "${ROOT}/Resources/ProfileWeb/app.js" "${STAGE_ROOT}/web/"
+    install -m 0644 "${ROOT}/app-icon.png" "${STAGE_ROOT}/web/app-icon.png"
+
+}
+
+build_local_backend() {
+    local app_bundle="${STAGE_ROOT}/${APP_STAGE_NAME}.app"
+    local contents="${app_bundle}/Contents"
+    local resources="${contents}/Resources"
+    mkdir -p "${contents}/MacOS" "${resources}"
+    cc -std=gnu17 -O2 -Wall -Wextra -arch arm64 -arch x86_64 \
+        -DAPP_NAME=\"${APP_NAME}\" "${ROOT}/Backend/MacContainerBackend.c" \
+        -o "${contents}/MacOS/${BACKEND_EXECUTABLE_NAME}"
+    cp -R "${STAGE_ROOT}/bundles" "${STAGE_ROOT}/web" "${resources}/"
+    cp "${ROOT}/app-icon.png" "${resources}/"
+    local context="${BUILD_DIR}/worker"
+    rm -rf "${context}"
+    mkdir -p "${context}"
+    cp -R "${ROOT}/Backend" "${STAGE_ROOT}/web" "${STAGE_ROOT}/bundles" "${context}/"
+    cp "${ROOT}/Backend/ContainerWorker.Dockerfile" "${context}/Dockerfile"
+    local image="outershell/profile-tracing-worker:local"
+    cp -R "${context}" "${resources}/worker-build"
+    printf '%s\n' "${image}" > "${resources}/worker-image"
+    if docker_is_ready; then
+        docker build -t "${image}" "${context}"
+    fi
+    local helper_arch
+    helper_arch="$(uname -m)"
+    mkdir -p "${resources}/helpers"
+    "${ROOT}/Helper/build.sh" linux "${helper_arch}" "${resources}/helpers/outer-profile-helper"
+    local info_plist="${contents}/Info.plist"
+    rm -f "${info_plist}"
+    /usr/bin/plutil -create xml1 "${info_plist}"
+    /usr/bin/plutil -insert CFBundleExecutable -string "${BACKEND_EXECUTABLE_NAME}" "${info_plist}"
+    /usr/bin/plutil -insert CFBundleIdentifier -string "${APP_ID}" "${info_plist}"
+    /usr/bin/plutil -insert CFBundleName -string "${APP_NAME}" "${info_plist}"
+    /usr/bin/plutil -insert CFBundlePackageType -string APPL "${info_plist}"
+    /usr/bin/plutil -insert CFBundleShortVersionString -string 1.0 "${info_plist}"
+    /usr/bin/plutil -insert CFBundleVersion -string 1 "${info_plist}"
+    /usr/bin/plutil -insert LSBackgroundOnly -bool true "${info_plist}"
+    /usr/bin/codesign --force --sign - --timestamp=none "${app_bundle}" >/dev/null
 }
 
 backend_directory() {
@@ -239,6 +307,7 @@ build_backend_in_container() {
         container run --rm --platform "${platform}" \
             --network "${network}" \
             --mount "type=bind,source=${ROOT}/Backend,target=/src/Backend,readonly" \
+            --mount "type=bind,source=${ROOT}/Helper,target=/src/Helper,readonly" \
             --mount "type=bind,source=${output_dir},target=/out" \
             --env CC=gcc \
             --env "BACKEND_SOURCE=${BACKEND_SOURCE}" \
@@ -251,6 +320,7 @@ build_backend_in_container() {
         docker run --rm --platform "${platform}" \
             --network none \
             --mount "type=bind,source=${ROOT}/Backend,target=/src/Backend,readonly" \
+            --mount "type=bind,source=${ROOT}/Helper,target=/src/Helper,readonly" \
             --mount "type=bind,source=${output_dir},target=/out" \
             --env CC=gcc \
             --env "BACKEND_SOURCE=${BACKEND_SOURCE}" \
@@ -266,7 +336,7 @@ build_backend_on_target() {
     local output_dir remote_build=".cache/outershell-app-build/${APP_ID}"
     output_dir="$(backend_directory "${STAGE_ROOT}" "${TARGET_LIBC}" "${TARGET_ARCH}")"
     echo "==> No build container runtime is available; building ${BACKEND_EXECUTABLE_NAME} on the ${TARGET_LIBC} target"
-    COPYFILE_DISABLE=1 tar czf - -C "${ROOT}" Backend | run_ssh "
+    COPYFILE_DISABLE=1 tar czf - -C "${ROOT}" Backend Helper | run_ssh "
         set -e
         rm -rf \"\$HOME/${remote_build}\"
         mkdir -p \"\$HOME/${remote_build}\"
@@ -293,7 +363,12 @@ build_target_backend() {
 
 cmd_build_backend() {
     probe_target
-    build_target_backend
+    if [[ "${TARGET_KIND}" == local ]]; then
+        [[ -d "${STAGE_ROOT}/bundles" ]] || cmd_build_frontend
+        build_local_backend
+    else
+        build_target_backend
+    fi
 }
 
 cmd_build_matrix() {
@@ -313,7 +388,11 @@ cmd_build() {
     rm -rf "${STAGE_ROOT}"
     mkdir -p "${STAGE_ROOT}"
     cmd_build_frontend
-    build_target_backend
+    if [[ "${TARGET_KIND}" == local ]]; then
+        build_local_backend
+    else
+        build_target_backend
+    fi
     echo "==> Payload ready at ${STAGE_ROOT}"
 }
 
@@ -323,11 +402,60 @@ find_outerctl_command() {
     printf '%s' 'if [ ! -x "$outerctl" ]; then echo "error: install the current Outer Shell on this target first" >&2; exit 1; fi; '
 }
 
+local_outerctl_path() {
+    local candidates=()
+    if [[ -n "${OUTERSHELL_HOME:-}" ]]; then
+        candidates+=("${OUTERSHELL_HOME}/bin/outerctl")
+    fi
+    candidates+=(
+        "${HOME}/Library/Application Support/outershell/bin/outerctl"
+        "${XDG_STATE_HOME:-${HOME}/.local/state}/outershell/bin/outerctl"
+    )
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if [[ -x "${candidate}" ]]; then
+            printf '%s\n' "${candidate}"
+            return
+        fi
+    done
+    candidate="$(command -v outerctl 2>/dev/null || true)"
+    if [[ -x "${candidate}" ]]; then
+        printf '%s\n' "${candidate}"
+        return
+    fi
+    echo "error: install the current Outer Shell on localhost first" >&2
+    exit 1
+}
+
 run_bundled_control() {
     local action="$1"
     local stage_root="${2:-}"
-    local scope command
+    local scope
     scope="$(target_scope)"
+    if [[ "${TARGET_KIND}" == local ]]; then
+        local outerctl
+        outerctl="$(local_outerctl_path)"
+        local args=(
+            bundled-app "${action}"
+            --backend "${APP_ID}"
+            --scope "${scope}"
+        )
+        if [[ "${action}" == install ]]; then
+            args+=(--stage-root "${stage_root}")
+        fi
+        if [[ "${scope}" == system && "${TARGET_UID}" != 0 ]]; then
+            local password
+            read -r -s -p "Administrator password for localhost: " password </dev/tty
+            printf '\n' >/dev/tty
+            printf '%s\n' "${password}" | "${outerctl}" "${args[@]}" --sudo-password-stdin
+            unset password
+        else
+            "${outerctl}" "${args[@]}"
+        fi
+        return
+    fi
+
+    local command
     command="$(find_outerctl_command)"
     command+="\"\$outerctl\" bundled-app ${action} --backend $(shell_quote "${APP_ID}") --scope $(shell_quote "${scope}")"
     if [[ "${action}" == install ]]; then
@@ -346,6 +474,12 @@ run_bundled_control() {
 
 cmd_deploy() {
     cmd_build
+    if [[ "${TARGET_KIND}" == local ]]; then
+        echo "==> Installing ${APP_NAME} on localhost through Outer Shell"
+        run_bundled_control install "${STAGE_ROOT}"
+        echo "Deployed ${APP_NAME} to localhost."
+        return
+    fi
     local remote_parent=".cache/outershell-app-deploy/${APP_ID}"
     local remote_stage="${TARGET_HOME}/${remote_parent}/${APP_STAGE_NAME}"
     echo "==> Uploading ${APP_NAME} payload"
@@ -367,8 +501,17 @@ cmd_uninstall() {
 
 cmd_target() {
     if [[ $# -ne 1 ]]; then
-        echo "usage: ./app target \"ssh -p 22 you@server\"" >&2
+        echo "usage: ./app target local" >&2
+        echo "       ./app target \"ssh -p 22 you@server\"" >&2
         exit 1
+    fi
+    if [[ "$1" == local || "$1" == localhost ]]; then
+        {
+            printf 'OUTER_TARGET_KIND=local\n'
+            printf 'OUTER_TARGET_SCOPE=%s\n' "${DEFAULT_DEPLOY_SCOPE:-user}"
+        } > "${ROOT}/target.env"
+        echo "Wrote target.env for localhost"
+        return
     fi
     read -r -a words <<< "$1"
     {
@@ -388,6 +531,12 @@ cmd_status() {
     probe_target
     local scope
     scope="$(target_scope)"
+    if [[ "${TARGET_KIND}" == local ]]; then
+        local domain
+        if [[ "${scope}" == system ]]; then domain=system; else domain="gui/${TARGET_UID}"; fi
+        launchctl print "${domain}/${APP_ID}" || true
+        return
+    fi
     if [[ "${scope}" == system ]]; then
         run_ssh "systemctl --system status '${APP_ID}.service' --no-pager" || true
     else
@@ -399,6 +548,17 @@ cmd_logs() {
     probe_target
     local scope
     scope="$(target_scope)"
+    if [[ "${TARGET_KIND}" == local ]]; then
+        local log_path
+        if [[ "${scope}" == system ]]; then
+            log_path="/Library/Logs/${APP_ID}.log"
+        else
+            log_path="${HOME}/Library/Logs/${APP_ID}/output.log"
+        fi
+        touch "${log_path}" 2>/dev/null || true
+        tail -n 80 -f "${log_path}"
+        return
+    fi
     if [[ "${scope}" == system ]]; then
         run_ssh -t "journalctl --system -u '${APP_ID}.service' -f"
     else
@@ -414,14 +574,15 @@ cmd_help() {
     cat <<EOF
 ${APP_NAME} development tasks
 
-  ./app target "ssh ..."  write target.env
-  ./app build             build a payload for target.env
+  ./app target local      make localhost the saved deploy target
+  ./app target "ssh ..."  make an SSH server the saved deploy target
+  ./app build [--local]   build a payload for the selected target
   ./app build-matrix      build all Linux libc/architecture release variants
-  ./app deploy            build, upload, and install through Outer Shell
-  ./app status            show the target service status
-  ./app logs              follow the target service log
+  ./app deploy [--local]  build and install through Outer Shell
+  ./app status [--local]  show the target service status
+  ./app logs [--local]    follow the target service log
   ./app ssh [command]     open a shell or run a target command
-  ./app uninstall         uninstall the target app
+  ./app uninstall [--local] uninstall the target app
   ./app clean             remove development build products
 
 Builds auto-select Apple container on macOS and Docker elsewhere.
@@ -432,6 +593,14 @@ EOF
 command="${1:-help}"
 shift $(( $# > 0 ? 1 : 0 ))
 case "${command}" in
+    build|build-backend|deploy|status|logs|uninstall)
+        if [[ "${1:-}" == --local || "${1:-}" == local ]]; then
+            TARGET_OVERRIDE_KIND=local
+            shift
+        fi
+        ;;
+esac
+case "${command}" in
     target) cmd_target "$@" ;;
     build) cmd_build ;;
     build-frontend) cmd_build_frontend ;;
@@ -440,7 +609,14 @@ case "${command}" in
     deploy) cmd_deploy ;;
     status) cmd_status ;;
     logs) cmd_logs ;;
-    ssh) probe_target; run_ssh "$@" ;;
+    ssh)
+        probe_target
+        if [[ "${TARGET_KIND}" == local ]]; then
+            echo "error: the ssh command requires an SSH target" >&2
+            exit 1
+        fi
+        run_ssh "$@"
+        ;;
     uninstall) cmd_uninstall ;;
     clean) cmd_clean ;;
     help|--help|-h) cmd_help ;;

@@ -31,3 +31,12 @@ location = new URL('https://profile.local/traces/0');
 context.restoreTraceURL();
 assert.equal(setups, 2);
 console.log('PASS trace deep links, duplicate event suppression, and history restoration');
+
+location = new URL('https://profile.local/targets/apple.container:demo/traces/9');
+context.restoreTraceURL();
+assert.equal(loads.at(-1), 9);
+context.updateTraceURL(10);
+assert.equal(location.pathname, '/targets/apple.container:demo/traces/10');
+context.updateTraceURL(null);
+assert.equal(location.pathname, '/targets/apple.container:demo/');
+console.log('PASS container-specific trace navigation');
