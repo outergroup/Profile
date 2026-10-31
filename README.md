@@ -131,9 +131,13 @@ recordings live in `/root/.local/state/outer-profile-helper`; mount that directo
 as persistent storage to retain recordings across rebuilds. Docker recordings
 remain in the Mac app's private state directory.
 
-The runtime contract reserves `wslc` separately from WSL distributions (`wsl`).
-Windows process spawning and live tracing remain to be implemented and tested on
-Windows; the Mac implementation is not a Windows app.
+Windows support is built and packaged by `Backends/Windows`. Its native C host
+runs as an ordinary user task and exposes a named pipe. Docker tracing uses a
+helper container with tracing capabilities and the selected container's PID
+namespace. WSLc has separate target identities from WSL distributions, but its
+current capability restrictions prevent live capture. The Windows picker explains
+this limitation. Both HTML and macOS native content are included. See
+`../Backends/Windows/README.md` for the permission model and build instructions.
 
 Run `python3 Scripts/test_macos_container_app.py` after installation to verify
 Docker APIs, host exclusion, HTML and favicon. The portable frame codec test is

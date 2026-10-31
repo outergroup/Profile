@@ -27,7 +27,7 @@ extern char **environ;
 #endif
 static volatile sig_atomic_t stopping;
 static char state[PATH_MAX], docker[PATH_MAX], worker[128];
-static _Atomic unsigned short worker_port;
+static _Atomic bool worker_ready;
 static void stop(int sig) { (void)sig; stopping=1; }
 static bool transfer(int fd, void *buffer, size_t size, bool writing) {
     char *p=buffer;
@@ -95,19 +95,12 @@ static void *refresh_registry(void *unused) {
     while(!stopping) {
         registry_snapshot();
         for(int i=0;i<5&&!stopping;i++) sleep(1);
-        if(worker_port) {
+        if(worker_ready) {
             char running[32];char *args[]={docker,"inspect","--format","{{.State.Running}}",worker,NULL};
-            if(command(args,running,sizeof(running)) || strncmp(running,"true",4)) worker_port=0;
+            if(command(args,running,sizeof(running)) || strncmp(running,"true",4)) worker_ready=false;
         }
     }
     return NULL;
-}
-static int connect_worker(void) {
-    int fd=socket(AF_INET,SOCK_STREAM,0); if(fd<0) return -1;
-    fcntl(fd,F_SETFD,FD_CLOEXEC);
-    struct sockaddr_in address={.sin_family=AF_INET,.sin_port=htons(worker_port),.sin_addr.s_addr=htonl(INADDR_LOOPBACK)};
-    if(connect(fd,(struct sockaddr *)&address,sizeof(address))) {close(fd);return -1;}
-    return fd;
 }
 #include "MacRuntimeTargets.h"
 static pthread_mutex_t docker_mutex=PTHREAD_MUTEX_INITIALIZER;
@@ -135,25 +128,23 @@ static bool start_docker_worker(void) {
     char *run[]={docker,"run","-d","--rm","--name",worker,"--label","org.outershell.tracing-worker=" APP_NAME,
         "--cap-add","BPF","--cap-add","PERFMON","--cap-add","SYS_PTRACE","--cap-add","DAC_READ_SEARCH",
         "--cap-add", !strcmp(APP_NAME,"Firehose")?"SYS_ADMIN":"PERFMON",
-        "--security-opt","seccomp=unconfined","--pid=host","--cgroupns=host","-p","127.0.0.1::7356","-v",mount,
+        "--security-opt","seccomp=unconfined","--pid=host","--cgroupns=host","--network","none","-v",mount,
         "-e","OUTER_CONTAINER_REGISTRY=/state/registry.bin",image,NULL};
     if(command(run,NULL,0)) {return false;}
-    char port[128];char *get_port[]={docker,"port",worker,"7356/tcp",NULL};
-    if(command(get_port,port,sizeof(port))) return false;
-    char *colon=strrchr(port,':');if(!colon) return false;
-    long number=strtol(colon+1,NULL,10);if(number<1||number>65535) return false;worker_port=(unsigned short)number;
+    TracingTarget target={0};
+    snprintf(target.provider,sizeof(target.provider),"docker-worker");
+    snprintf(target.id,sizeof(target.id),"%s",worker);
     bool ready=false;
-    for(int i=0;i<100&&!stopping;i++) {
-        int fd=connect_worker();
-        if(fd>=0) {
-            struct timeval timeout={.tv_sec=1};setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
-            char request[]="GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",response[12];
-            ready=transfer(fd,request,sizeof(request)-1,true)&&transfer(fd,response,sizeof(response),false)&&!memcmp(response,"HTTP/1.1 200",12);
-            close(fd);if(ready) break;
-        }
-        usleep(100000);
+    for(int i=0;i<40&&!stopping;i++) {
+        size_t length=0;
+        unsigned char *response=target_request(&target,"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",&length);
+        ready=response&&length>=12&&!memcmp(response,"HTTP/1.1 200",12);
+        free(response);
+        if(ready) break;
+        usleep(250000);
     }
-    if(!ready) {fprintf(stderr,"Container tracing worker failed to become ready.\n");worker_port=0;command(remove,NULL,0);return false;}
+    if(!ready) {fprintf(stderr,"Container tracing worker failed to become ready.\n");command(remove,NULL,0);return false;}
+    worker_ready=true;
     return true;
 }
 static void runtime_descriptor(int client) {
@@ -216,16 +207,14 @@ static void *proxy(void *value) {
         }
         close(client);return NULL;
     }
-    pthread_mutex_lock(&docker_mutex);bool ready=worker_port||start_docker_worker();pthread_mutex_unlock(&docker_mutex);
-    int remote=ready?connect_worker():-1;
-    if(remote<0){runtime_error(client,"Docker tracing worker unavailable. Check that Docker is running.");close(client);return NULL;}
-    setsockopt(remote,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout));
-    setsockopt(remote,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout));
-    if(transfer(remote,forwarded,(size_t)written,true)) {
-        char bytes[65536];ssize_t n;
-        while((n=read(remote,bytes,sizeof(bytes)))>0)if(!transfer(client,bytes,(size_t)n,true))break;
-    }
-    close(remote);close(client);return NULL;
+    pthread_mutex_lock(&docker_mutex);bool ready=worker_ready||start_docker_worker();pthread_mutex_unlock(&docker_mutex);
+    TracingTarget target={0};
+    snprintf(target.provider,sizeof(target.provider),"docker-worker");
+    snprintf(target.id,sizeof(target.id),"%s",worker);
+    size_t length=0;unsigned char *response=ready?target_request(&target,forwarded,&length):NULL;
+    if(response){transfer(client,response,length,true);free(response);}
+    else runtime_error(client,"Docker tracing worker unavailable. Check that Docker is running.");
+    close(client);return NULL;
 }
 
 int main(int argc,char **argv) {
@@ -280,6 +269,6 @@ int main(int argc,char **argv) {
     close(listener);if(!launchd_name) unlink(socket_path);
 cleanup:
     stopping=1;pthread_join(registry,NULL);targets_close();
-    if(worker_port) {char *remove[]={docker,"rm","-f",worker,NULL};command(remove,NULL,0);}
+    if(worker_ready) {char *remove[]={docker,"rm","-f",worker,NULL};command(remove,NULL,0);}
     return 0;
 }

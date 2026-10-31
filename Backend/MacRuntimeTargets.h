@@ -3,6 +3,7 @@
 #include "TracingStream.h"
 #include <ctype.h>
 
+#define TRACING_WORKER_SOCKET "/run/outer-tracing/worker.sock"
 typedef struct { char provider[32],id[257],name[256],state[32]; } TracingTarget;
 static char resource_directory[PATH_MAX];
 static _Thread_local bool runtime_head_request;
@@ -69,13 +70,16 @@ static unsigned char *target_request(const TracingTarget *target,const char *req
     if(!session)for(int i=0;i<32;i++)if(!target_sessions[i].pid){session=&target_sessions[i];break;}
     if(!session){pthread_mutex_unlock(&target_mutex);return NULL;}
     if(!session->pid) {
-        const char *executable=!strcmp(target->provider,"apple.container")?"/usr/local/bin/container":"/usr/local/bin/wslc";
+        const bool docker_worker=!strcmp(target->provider,"docker-worker");
+        const char *executable=docker_worker?docker:!strcmp(target->provider,"apple.container")?"/usr/local/bin/container":"/usr/local/bin/wslc";
         if(access(executable,X_OK)){pthread_mutex_unlock(&target_mutex);return NULL;}
         char context[384],name[320],helper[128];
         snprintf(context,sizeof(context),"OUTER_TRACING_CONTEXT_ID=%s",key);
         snprintf(name,sizeof(name),"OUTER_TRACING_CONTEXT_NAME=%s",target->name);
         snprintf(helper,sizeof(helper),"/usr/local/bin/outer-%s-helper",!strcmp(APP_NAME,"Profile")?"profile":"firehose");
-        char *args[]={(char *)executable,"exec","--interactive","--user","0","-e",context,"-e",name,(char *)target->id,helper,"serve",NULL};
+        char *helper_args[]={(char *)executable,"exec","--interactive","--user","0","-e",context,"-e",name,(char *)target->id,helper,"serve",NULL};
+        char *worker_args[]={(char *)executable,"exec","--interactive","-e","OUTER_TRACING_SOCKET=" TRACING_WORKER_SOCKET,(char *)target->id,"/usr/local/bin/worker","serve",NULL};
+        char **args=docker_worker?worker_args:helper_args;
         int input[2],output[2];if(pipe(input)){pthread_mutex_unlock(&target_mutex);return NULL;}
         if(pipe(output)){close(input[0]);close(input[1]);pthread_mutex_unlock(&target_mutex);return NULL;}
         for(int i=0;i<2;i++){fcntl(input[i],F_SETFD,FD_CLOEXEC);fcntl(output[i],F_SETFD,FD_CLOEXEC);}

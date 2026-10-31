@@ -2531,6 +2531,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "ProfileBackend listening on %s\n", socket_path);
         }
     }
+    if (fcntl(listener, F_SETFD, FD_CLOEXEC) < 0) {
+        perror("listener close-on-exec");
+        close(listener);
+        return 1;
+    }
     g_listener_fd = listener;
 
     while (!g_shutdown_requested) {
@@ -2545,6 +2550,11 @@ int main(int argc, char **argv) {
         if (client < 0) {
             if (errno == EINTR) continue;
             break;
+        }
+        if (fcntl(client, F_SETFD, FD_CLOEXEC) < 0) {
+            perror("client close-on-exec");
+            close(client);
+            continue;
         }
         handle_client(client);
         close(client);

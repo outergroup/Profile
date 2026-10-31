@@ -245,7 +245,7 @@ build_local_backend() {
     mkdir -p "${context}"
     cp -R "${ROOT}/Backend" "${STAGE_ROOT}/web" "${STAGE_ROOT}/bundles" "${context}/"
     cp "${ROOT}/Backend/ContainerWorker.Dockerfile" "${context}/Dockerfile"
-    local image="outershell/profile-tracing-worker:local"
+    local image="outershell/profile-tracing-worker:$(cd "${context}" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum | shasum | cut -c1-12)"
     cp -R "${context}" "${resources}/worker-build"
     printf '%s\n' "${image}" > "${resources}/worker-image"
     if docker_is_ready; then

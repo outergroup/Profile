@@ -61,18 +61,25 @@ static void tracing_stop_child(pid_t child) {
 #include <sys/mount.h>
 static int tracing_serve(const char *executable,const char *app) {
     char temporary[]="/tmp/outer-tracing-XXXXXX";
-    if(!mkdtemp(temporary)) return 1;
-    char path[108];snprintf(path,sizeof(path),"%s/socket",temporary);
+    char path[108];
+    const char *existing=getenv("OUTER_TRACING_SOCKET");
+    if(existing&&*existing) {
+        if(strlen(existing)>=sizeof(path)) return 1;
+        snprintf(path,sizeof(path),"%s",existing);
+    } else {
+        if(!mkdtemp(temporary)) return 1;
+        snprintf(path,sizeof(path),"%s/socket",temporary);
+    }
     char tracefs[128] = "";
-    if (!strcmp(app, "Firehose") && access("/sys/kernel/tracing/events", R_OK) &&
+    if (!existing && !strcmp(app, "Firehose") && access("/sys/kernel/tracing/events", R_OK) &&
         access("/sys/kernel/debug/tracing/events", R_OK)) {
         snprintf(tracefs, sizeof(tracefs), "%s/tracefs", temporary);
         if (!mkdir(tracefs, 0700) && !mount("tracefs", tracefs, "tracefs", 0, NULL))
             setenv("OUTER_TRACEFS", tracefs, 1);
     }
-    pid_t child=fork();
+    pid_t child=existing?0:fork();
     if(child<0){rmdir(temporary);return 1;}
-    if(!child) {
+    if(!child&&!existing) {
         dup2(STDERR_FILENO,STDOUT_FILENO);
         if(!strcmp(app,"Profile")) {
             const char *home=getenv("HOME");if(!home) home="/tmp";
@@ -84,7 +91,7 @@ static int tracing_serve(const char *executable,const char *app) {
     int ready=0;
     for(int i=0;i<100;i++) {
         if(!access(path,F_OK)){ready=1;break;}
-        if(waitpid(child,NULL,WNOHANG)==child){child=0;break;}
+        if(child&&waitpid(child,NULL,WNOHANG)==child){child=0;break;}
         usleep(100000);
     }
     if(ready) for(;;) {
@@ -110,6 +117,7 @@ static int tracing_serve(const char *executable,const char *app) {
         if(ok)ok=tracing_frame_write(STDOUT_FILENO,id,response,used);
         free(response);if(!ok)break;
     }
+    if(existing) return ready?0:1;
     tracing_stop_child(child);
     if (*tracefs) { umount(tracefs); rmdir(tracefs); }
     unlink(path);rmdir(temporary);return ready?0:1;
