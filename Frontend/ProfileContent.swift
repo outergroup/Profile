@@ -798,6 +798,9 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             guard !perfMachineUnsupported else { return }
             handleUnmarkText()
 
+        case .windowActiveUpdate(let isActive):
+            if !isActive { perfPathInputController.breakUndoCoalescing() }
+
         case .textCommand(let command):
             guard !perfMachineUnsupported else { return }
             handleTextCommand(command)
@@ -4005,12 +4008,12 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             for representation in item.representations {
                 if representation.typeIdentifier == NSPasteboard.PasteboardType.string.rawValue,
                    let string = String(data: representation.data, encoding: .utf8) {
-                    perfPathInputController.insertText(string)
+                    perfPathInputController.pasteText(string)
                     return
                 }
                 if representation.typeIdentifier == NSPasteboard.PasteboardType.rtf.rawValue,
                    let attributed = NSAttributedString(rtf: representation.data, documentAttributes: nil) {
-                    perfPathInputController.insertText(attributed.string)
+                    perfPathInputController.pasteText(attributed.string)
                     return
                 }
             }

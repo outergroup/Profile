@@ -9,6 +9,8 @@ BUILD_ROOT="${BUILD_ROOT:-${REPO_ROOT}/build/frontend}"
 PACKAGE_ROOT="${PACKAGE_ROOT:-${REPO_ROOT}/build/linux-package}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_ROOT}/build/release}"
 CONFIGURATION="${CONFIGURATION:-Release}"
+APP_CODESIGN_IDENTITY="${APP_CODESIGN_IDENTITY:-${OUTER_SHELL_CODESIGN_IDENTITY:-${CODE_SIGN_IDENTITY:--}}}"
+APP_NOTARY_PROFILE="${APP_NOTARY_PROFILE:-${OUTER_SHELL_NOTARY_PROFILE:-}}"
 
 require_file() {
     if [[ ! -f "$1" ]]; then
@@ -38,7 +40,8 @@ echo "==> Building Profile frontend"
     build
 
 echo "==> Archiving ProfileContent bundles"
-"${REPO_ROOT}/Scripts/archive_profile_bundle.sh" \
+APP_CODESIGN_IDENTITY="${APP_CODESIGN_IDENTITY}" APP_NOTARY_PROFILE="${APP_NOTARY_PROFILE}" \
+    "${REPO_ROOT}/Scripts/archive_profile_bundle.sh" \
     "${BUILD_ROOT}/${CONFIGURATION}/Profile.bundle" \
     "${PACKAGE_ROOT}/bundles" \
     ProfileContent.bundle

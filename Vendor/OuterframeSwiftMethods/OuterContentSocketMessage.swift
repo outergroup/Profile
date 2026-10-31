@@ -1632,6 +1632,8 @@ public struct OuterframeEditCommandSet: OptionSet, Sendable {
     public static let cut = OuterframeEditCommandSet(rawValue: 1 << 1)
     public static let paste = OuterframeEditCommandSet(rawValue: 1 << 2)
     public static let selectAll = OuterframeEditCommandSet(rawValue: 1 << 3)
+    public static let undo = OuterframeEditCommandSet(rawValue: 1 << 7)
+    public static let redo = OuterframeEditCommandSet(rawValue: 1 << 8)
     public static let standard: OuterframeEditCommandSet = [.copy, .cut, .paste, .selectAll]
 }
 
