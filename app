@@ -252,9 +252,10 @@ build_local_backend() {
         docker build -t "${image}" "${context}"
     fi
     local helper_arch
-    helper_arch="$(uname -m)"
-    mkdir -p "${resources}/helpers"
-    "${ROOT}/Helper/build.sh" linux "${helper_arch}" "${resources}/helpers/outer-profile-helper"
+    for helper_arch in x86_64 aarch64; do
+        mkdir -p "${resources}/helpers/linux-${helper_arch}"
+        "${ROOT}/Helper/build.sh" linux "${helper_arch}" "${resources}/helpers/linux-${helper_arch}/outer-profile-helper"
+    done
     local info_plist="${contents}/Info.plist"
     rm -f "${info_plist}"
     /usr/bin/plutil -create xml1 "${info_plist}"

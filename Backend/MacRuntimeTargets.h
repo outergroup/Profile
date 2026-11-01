@@ -1,6 +1,7 @@
 #ifndef MAC_RUNTIME_TARGETS_H
 #define MAC_RUNTIME_TARGETS_H
 #include "TracingStream.h"
+#include "ContainerHelper.h"
 #include <ctype.h>
 
 #define TRACING_WORKER_SOCKET "/run/outer-tracing/worker.sock"
@@ -63,6 +64,23 @@ static void target_session_close(TracingSession *session) {
 static void targets_close(void) {
     pthread_mutex_lock(&target_mutex);for(int i=0;i<32;i++)target_session_close(&target_sessions[i]);pthread_mutex_unlock(&target_mutex);
 }
+static ContainerHelper helper_files;
+static bool helper_files_loaded;
+// Reads the helper script's first line and uploads the helper when the
+// container needs it.
+static bool helper_handshake(TracingSession *session) {
+    char line[512],message[512];size_t used=0;
+    for(;;) {
+        struct pollfd pfd={.fd=session->output,.events=POLLIN};
+        if(used+1==sizeof(line)||poll(&pfd,1,30000)<=0||!transfer(session->output,line+used,1,false))return false;
+        if(line[used]=='\n')break;
+        used++;
+    }
+    line[used]=0;
+    int architecture=0,reply=container_helper_reply(line,&architecture,message,sizeof(message));
+    if(!reply)fprintf(stderr,"Container helper: %s\n",message);
+    return reply==1||(reply==2&&transfer(session->input,helper_files.data[architecture],helper_files.length[architecture],true));
+}
 static unsigned char *target_request(const TracingTarget *target,const char *request,size_t *length) {
     char key[320];snprintf(key,sizeof(key),"%s:%s",target->provider,target->id);
     pthread_mutex_lock(&target_mutex);TracingSession *session=NULL;
@@ -73,11 +91,17 @@ static unsigned char *target_request(const TracingTarget *target,const char *req
         const bool docker_worker=!strcmp(target->provider,"docker-worker");
         const char *executable=docker_worker?docker:!strcmp(target->provider,"apple.container")?"/usr/local/bin/container":"/usr/local/bin/wslc";
         if(access(executable,X_OK)){pthread_mutex_unlock(&target_mutex);return NULL;}
-        char context[384],name[320],helper[128];
+        char context[384],name[320],helpers[PATH_MAX];
         snprintf(context,sizeof(context),"OUTER_TRACING_CONTEXT_ID=%s",key);
         snprintf(name,sizeof(name),"OUTER_TRACING_CONTEXT_NAME=%s",target->name);
-        snprintf(helper,sizeof(helper),"/usr/local/bin/outer-%s-helper",!strcmp(APP_NAME,"Profile")?"profile":"firehose");
-        char *helper_args[]={(char *)executable,"exec","--interactive","--user","0","-e",context,"-e",name,(char *)target->id,helper,"serve",NULL};
+        snprintf(helpers,sizeof(helpers),"%s/helpers",resource_directory);
+        const bool profile=!strcmp(APP_NAME,"Profile");
+        if(!docker_worker&&!helper_files_loaded)
+            helper_files_loaded=container_helper_load(&helper_files,profile?"org.outershell.Profile":"org.outershell.Firehose",profile?"outer-profile-helper":"outer-firehose-helper",helpers);
+        if(!docker_worker&&!helper_files_loaded){pthread_mutex_unlock(&target_mutex);return NULL;}
+        char *helper_args[32]={(char *)executable,"exec","--interactive","--user","0","-e",context,"-e",name,(char *)target->id,NULL};
+        const char *serve[]={"serve",NULL};
+        if(!docker_worker&&!container_helper_command(&helper_files,(const char **)helper_args,10,32,serve)){pthread_mutex_unlock(&target_mutex);return NULL;}
         char *worker_args[]={(char *)executable,"exec","--interactive","-e","OUTER_TRACING_SOCKET=" TRACING_WORKER_SOCKET,(char *)target->id,"/usr/local/bin/worker","serve",NULL};
         char **args=docker_worker?worker_args:helper_args;
         int input[2],output[2];if(pipe(input)){pthread_mutex_unlock(&target_mutex);return NULL;}
@@ -89,6 +113,7 @@ static unsigned char *target_request(const TracingTarget *target,const char *req
         close(input[0]);close(output[1]);
         if(error){close(input[1]);close(output[0]);session->pid=0;pthread_mutex_unlock(&target_mutex);return NULL;}
         session->input=input[1];session->output=output[0];snprintf(session->key,sizeof(session->key),"%s",key);
+        if(!docker_worker&&!helper_handshake(session)){target_session_close(session);pthread_mutex_unlock(&target_mutex);return NULL;}
     }
     unsigned char *result=NULL;uint32_t id=++session->sequence,response_id=0;
     if(tracing_frame_write(session->input,id,request,strlen(request))) {

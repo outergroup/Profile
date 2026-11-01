@@ -117,9 +117,9 @@ The registry, rather than CLI container listings, supplies targets.
 Build and install with `./app deploy --local`. Xcode and either Docker or Apple
 Container are needed to build the Linux helper. Set
 `OUTER_BUILD_CONTAINER_RUNTIME=container|docker` to choose the builder. The app
-packages its helper under `Contents/Resources/helpers`, and Outer Shell's
-container bootstrap includes it in new base images. Existing images need their
-helper installed at `/usr/local/bin/outer-profile-helper` and rebuilt.
+packages its helpers under `Contents/Resources/helpers/linux-<arch>` and copies
+the helper into a container the first time it needs it (see
+`Backend/ContainerHelper.h`, which comes from Outer Shell).
 Docker worker images are built during installation when Docker is available, or
 on first Docker use otherwise.
 
