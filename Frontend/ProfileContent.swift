@@ -654,7 +654,29 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         self.retainedSelf = self
     }
 
+    private func resetTextCaretBlink() {
+        let caretLayers: [CALayer] = [processSearchCursorLayer]
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for caret in caretLayers {
+            guard let animation = caret.animation(forKey: processSearchCaretBlinkAnimationKey)?.copy() as? CAAnimation else { continue }
+            caret.removeAnimation(forKey: processSearchCaretBlinkAnimationKey)
+            caret.opacity = 1
+            animation.beginTime = CACurrentMediaTime() + 0.55
+            caret.add(animation, forKey: processSearchCaretBlinkAnimationKey)
+        }
+        CATransaction.commit()
+    }
+
     func outerframeHost(_ host: OuterframeHost, didReceiveMessage message: BrowserToContentMessage) {
+        switch message {
+        case .keyDown, .textInput, .setMarkedText, .textCommand, .setCursorPosition,
+             .mouseDown, .mouseDragged, .pasteboardContentPasted, .pasteboardContentDropped,
+             .contextMenuItemSelected, .accessibilityActionAndSnapshot:
+            resetTextCaretBlink()
+        default:
+            break
+        }
         switch message {
         case .initializeContent(let arguments):
             outerframeHost.configure(url: arguments.url ?? "",
@@ -3437,7 +3459,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
         processSearchCursorLayer.frame = caretRect
         processSearchCursorLayer.isHidden = false
         processSearchCursorLayer.opacity = 1
-        processSearchCursorLayer.removeAnimation(forKey: processSearchCaretBlinkAnimationKey)
+        guard processSearchCursorLayer.animation(forKey: processSearchCaretBlinkAnimationKey) == nil else { return }
         let animation = CABasicAnimation(keyPath: "opacity")
         animation.fromValue = 1
         animation.toValue = 0
@@ -3789,49 +3811,19 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     }
 
     private func previousProcessSearchWordBoundary(from position: Int) -> Int {
-        guard !processSearchText.isEmpty else { return 0 }
         let clamped = min(max(position, 0), processSearchText.count)
-        guard clamped > 0 else { return 0 }
-
-        let tokenizer = CFStringTokenizerCreate(kCFAllocatorDefault,
-                                                processSearchText as CFString,
-                                                CFRangeMake(0, processSearchText.utf16.count),
-                                                kCFStringTokenizerUnitWordBoundary,
-                                                nil)
-        var previous = 0
-        var tokenType = CFStringTokenizerAdvanceToNextToken(tokenizer)
-        while tokenType.rawValue != 0 {
-            let range = CFStringTokenizerGetCurrentTokenRange(tokenizer)
-            let end = characterIndex(forUTF16: range.location + range.length, in: processSearchText)
-            if end >= clamped {
-                break
-            }
-            previous = end
-            tokenType = CFStringTokenizerAdvanceToNextToken(tokenizer)
-        }
-        return previous
+        let index = processSearchText.index(processSearchText.startIndex, offsetBy: clamped)
+        let offset = index.utf16Offset(in: processSearchText)
+        let boundary = NSAttributedString(string: processSearchText).nextWord(from: offset, forward: false)
+        return characterIndex(forUTF16: boundary, in: processSearchText)
     }
 
     private func nextProcessSearchWordBoundary(from position: Int) -> Int {
-        guard !processSearchText.isEmpty else { return 0 }
         let clamped = min(max(position, 0), processSearchText.count)
-        guard clamped < processSearchText.count else { return processSearchText.count }
-
-        let tokenizer = CFStringTokenizerCreate(kCFAllocatorDefault,
-                                                processSearchText as CFString,
-                                                CFRangeMake(0, processSearchText.utf16.count),
-                                                kCFStringTokenizerUnitWordBoundary,
-                                                nil)
-        var tokenType = CFStringTokenizerAdvanceToNextToken(tokenizer)
-        while tokenType.rawValue != 0 {
-            let range = CFStringTokenizerGetCurrentTokenRange(tokenizer)
-            let end = characterIndex(forUTF16: range.location + range.length, in: processSearchText)
-            if end > clamped {
-                return end
-            }
-            tokenType = CFStringTokenizerAdvanceToNextToken(tokenizer)
-        }
-        return processSearchText.count
+        let index = processSearchText.index(processSearchText.startIndex, offsetBy: clamped)
+        let offset = index.utf16Offset(in: processSearchText)
+        let boundary = NSAttributedString(string: processSearchText).nextWord(from: offset, forward: true)
+        return characterIndex(forUTF16: boundary, in: processSearchText)
     }
 
     private func showProcessSearchContextMenu(at point: CGPoint) {
