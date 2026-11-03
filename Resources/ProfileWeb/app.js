@@ -400,7 +400,8 @@
   function renderProfile() {
     const profile = state.profile;
     const duration = profile.end - profile.start;
-    setProfileStatus(`Captured ${profile.samples} samples across ${profile.aggregates} stacks in ${duration.toFixed(2)} s${profile.cpu >= 0 ? `, ${profile.cpu.toFixed(1)} ms CPU total.` : '.'}`);
+    const summary = `Captured ${profile.samples} samples across ${profile.aggregates} stacks in ${duration.toFixed(2)} s${profile.cpu >= 0 ? `, ${profile.cpu.toFixed(1)} ms CPU total.` : '.'}`;
+    setProfileStatus(profile.samples === 0 && profile.status ? profile.status : summary);
     $('#rangeLabel').textContent = `${formatTime(profile.start)} – ${formatTime(profile.end)} selected (${formatTime(duration)})`;
     $('#flameTitle').textContent = `Profile  pid ${profile.pid}, ${profile.duration.toFixed(2)} s at ${profile.frequency} Hz`;
     requestAnimationFrame(() => {
@@ -777,6 +778,7 @@
       setSetupStatus('Select a process first.');
       return;
     }
+    if (!state.perf.usable && !state.perf.machineUnsupported) await refreshPerf();
     if (!state.perf.usable || state.perf.machineUnsupported) {
       showSetup();
       setSetupStatus(state.perf.message || 'perf is not available.');
@@ -963,5 +965,9 @@
   window.addEventListener('popstate', restoreTraceURL);
   restoreTraceURL();
   Promise.all([refreshProcesses(), refreshPerf(), refreshRuns()]);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && !state.perf.usable && !state.perf.machineUnsupported) refreshPerf();
+  });
+  setInterval(() => { if (!state.perf.usable && !state.perf.machineUnsupported) refreshPerf(); }, 5000);
   setInterval(() => { if (state.recording) refreshRuns(); }, 1000);
 })();

@@ -226,6 +226,7 @@ cmd_build_frontend() {
         "${STAGE_ROOT}/bundles" \
         "${BUNDLE_ARCHIVE_STEM}"
     install -m 0644 "${ROOT}/Resources/ProfileWeb/index.html" "${ROOT}/Resources/ProfileWeb/app.css" "${ROOT}/Resources/ProfileWeb/app.js" "${STAGE_ROOT}/web/"
+    install -m 0644 "${ROOT}/app-icon.png" "${STAGE_ROOT}/app-icon.png"
     install -m 0644 "${ROOT}/app-icon.png" "${STAGE_ROOT}/web/app-icon.png"
 
 }

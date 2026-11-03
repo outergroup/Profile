@@ -148,7 +148,7 @@ static ContainerContext container_for_pid(int pid) {
         if (strcmp(candidate.id,"host")) { context=candidate; context.local_pid=pid; break; }
     }
     pthread_mutex_unlock(&container_lock); fclose(file);
-    snprintf(path,sizeof(path),"/proc/%d/status",pid); file=fopen(path,"r");
+    snprintf(path,sizeof(path),"/proc/%d/status",pid); file=strcmp(context.id,"host")?fopen(path,"r"):NULL;
     if (file) {
         while (fgets(line,sizeof(line),file)) if (!strncmp(line,"NSpid:",6)) {
             char *p=line+6,*end;

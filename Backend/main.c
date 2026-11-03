@@ -587,6 +587,17 @@ static int compare_process_rows(const void *a, const void *b) {
     return left->pid - right->pid;
 }
 
+#ifdef __linux__
+static char *full_process_name(const char *comm, const char *argv0) {
+    const size_t comm_limit = 15;
+    if (!comm || !argv0 || strlen(comm) != comm_limit) return NULL;
+    const char *slash = strrchr(argv0, '/');
+    const char *base = slash ? slash + 1 : argv0;
+    if (strlen(base) <= comm_limit || strncmp(base, comm, comm_limit) != 0) return NULL;
+    return strdup(base);
+}
+#endif
+
 static bool collect_processes(ProcessList *list) {
 #ifdef __linux__
     DIR *dir = opendir("/proc");
@@ -616,11 +627,15 @@ static bool collect_processes(ProcessList *list) {
         char cmd_path[PATH_MAX];
         snprintf(cmd_path, sizeof(cmd_path), "/proc/%d/cmdline", pid);
         char *cmd = read_text_file(cmd_path, 4096);
-        if (cmd) {
-            for (char *p = cmd; p < cmd + 4096 && *p; p++) {
-                if (*p == '\0') *p = ' ';
+        if (cmd && name) {
+            char *full_name = full_process_name(name, cmd);
+            if (full_name) {
+                free(name);
+                name = full_name;
             }
-            for (size_t i = 0; i < 4096 && cmd[i]; i++) {
+            size_t length = 4096;
+            while (length > 0 && cmd[length - 1] == '\0') length--;
+            for (size_t i = 0; i < length; i++) {
                 if (cmd[i] == '\0') cmd[i] = ' ';
             }
         }
@@ -1055,6 +1070,13 @@ static void copy_first_nonempty_line(const char *text, char *dst, size_t dst_siz
     }
 }
 
+static void copy_perf_error_line(const char *text, char *dst, size_t dst_size) {
+    const char *p = text ? text : "";
+    while (*p == '\n' || *p == '\r' || isspace((unsigned char)*p)) p++;
+    if (strncmp(p, "Error:", 6) == 0 && strspn(p + 6, " \t") == strcspn(p + 6, "\r\n")) p += 6 + strcspn(p + 6, "\r\n");
+    copy_first_nonempty_line(p, dst, dst_size);
+}
+
 static bool check_perf_available(const char *perf, char *message, size_t message_size) {
     if (message && message_size > 0) message[0] = '\0';
     int pipe_fds[2];
@@ -1175,6 +1197,83 @@ static bool check_perf_kernel_available(char *message, size_t message_size, bool
 #endif
 }
 
+static bool perf_event_allowed(bool kernel, bool namespaces) {
+#if defined(__linux__) && defined(__NR_perf_event_open)
+    struct perf_event_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.type = PERF_TYPE_SOFTWARE;
+    attr.size = sizeof(attr);
+    attr.config = PERF_COUNT_SW_CPU_CLOCK;
+    attr.disabled = 1;
+    attr.exclude_kernel = kernel ? 0 : 1;
+    attr.exclude_hv = 1;
+    if (namespaces) {
+        // Older kernel headers predate the namespaces bit, so set it at its fixed ABI position.
+        uint64_t flags;
+        memcpy(&flags, (char *)&attr + 40, sizeof(flags));
+        flags |= UINT64_C(1) << 28;
+        memcpy((char *)&attr + 40, &flags, sizeof(flags));
+    }
+    int fd = (int)syscall(__NR_perf_event_open, &attr, 0, -1, -1, PERF_FLAG_FD_CLOEXEC);
+    if (fd < 0) return false;
+    close(fd);
+    return true;
+#else
+    (void)kernel; (void)namespaces;
+    return false;
+#endif
+}
+
+static const char *perf_namespaces_option(void) {
+    return !container_selected().id[0] && perf_event_allowed(false, true) ? "--namespaces" : "--no-namespaces";
+}
+
+static const char *perf_callchain_option(void) {
+    return perf_event_allowed(true, false) ? NULL : "--user-callchains";
+}
+
+static bool check_process_profilable(int pid, char *message, size_t message_size) {
+#if defined(__linux__) && defined(__NR_perf_event_open)
+    struct perf_event_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.type = PERF_TYPE_SOFTWARE;
+    attr.size = sizeof(attr);
+    attr.config = PERF_COUNT_SW_CPU_CLOCK;
+    attr.disabled = 1;
+    attr.exclude_kernel = 1;
+    attr.exclude_hv = 1;
+    int fd = (int)syscall(__NR_perf_event_open, &attr, pid, -1, -1, PERF_FLAG_FD_CLOEXEC);
+    if (fd >= 0) {
+        close(fd);
+        return true;
+    }
+    int err = errno;
+    if (err != EACCES && err != EPERM) return true;
+    char path[64], name[256] = "";
+    snprintf(path, sizeof(path), "/proc/%d/comm", pid);
+    char *comm = read_text_file(path, 64);
+    if (comm) {
+        copy_first_nonempty_line(comm, name, sizeof(name));
+        free(comm);
+    }
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+    char *argv0 = read_text_file(path, 4096);
+    char *full_name = full_process_name(name, argv0);
+    if (full_name) snprintf(name, sizeof(name), "%s", full_name);
+    free(full_name);
+    free(argv0);
+    snprintf(message,
+             message_size,
+             "Linux won't let Profile record %s (PID %d). The process blocks inspection by other programs, as Outer Loop and some other security-sensitive apps do. Recording it requires root.\n",
+             name[0] ? name : "this process",
+             pid);
+    return false;
+#else
+    (void)pid; (void)message; (void)message_size;
+    return true;
+#endif
+}
+
 static bool check_perf_ready(const char *perf, char *message, size_t message_size) {
     if (message && message_size > 0) message[0] = '\0';
     if (!check_perf_available(perf, message, message_size)) return false;
@@ -1221,7 +1320,7 @@ static void refresh_perf_status(void) {
 
 static bool cached_perf_ready(char *message, size_t message_size) {
     const char *perf = find_perf_binary();
-    if (!g_perf_status_checked || (g_perf_path[0] != '\0' && strcmp(g_perf_status_path, perf) != 0)) {
+    if (!g_perf_status_checked || !g_perf_status_usable || (g_perf_path[0] != '\0' && strcmp(g_perf_status_path, perf) != 0)) {
         refresh_perf_status();
     }
     if (message && message_size > 0) {
@@ -1855,7 +1954,7 @@ static ProfileRun *install_completed_profile_run(ContainerContext container, uin
             }
         } else if (!perf_record_status_ok(record_status) && record_output && record_output[0]) {
             char detail[384];
-            copy_first_nonempty_line(record_output, detail, sizeof(detail));
+            copy_perf_error_line(record_output, detail, sizeof(detail));
             if (detail[0]) {
                 snprintf(status_buffer, sizeof(status_buffer), "perf record failed: %s", detail);
                 status = status_buffer;
@@ -1950,6 +2049,11 @@ static void send_profile_capture(int fd, const char *query) {
         send_text_response(fd, 500, perf_error[0] ? perf_error : "perf is not installed or is not usable.\n");
         return;
     }
+    char access_error[512];
+    if (!check_process_profilable(pid, access_error, sizeof(access_error))) {
+        send_text_response(fd, 403, access_error);
+        return;
+    }
     const char *perf = g_perf_status_path[0] ? g_perf_status_path : find_perf_binary();
     char temp_template[] = "/tmp/outer-profile-XXXXXX";
     char *temp_dir = mkdtemp(temp_template);
@@ -1969,11 +2073,12 @@ static void send_profile_capture(int fd, const char *query) {
     bool have_cpu_ticks_before = read_process_cpu_ticks(pid, &cpu_ticks_before);
     double profile_start_time = monotonic_seconds();
 
+    const char *callchains = perf_callchain_option();
     char command[PATH_MAX * 4];
     snprintf(command, sizeof(command),
-             "'%s' record %s -e cpu-clock -F %d -g --call-graph fp -p %d -o '%s' -- sleep %d > '%s' 2>&1",
-             perf, container_selected().id[0] ? "--no-namespaces" : "--namespaces",
-             frequency, pid, perf_data, duration, record_log);
+             "'%s' record %s -e cpu-clock -F %d -g --call-graph fp%s -p %d -o '%s' -- sleep %d > '%s' 2>&1",
+             perf, perf_namespaces_option(), frequency, callchains ? " --user-callchains" : "",
+             pid, perf_data, duration, record_log);
     int record_status = system(command);
     double profile_end_time = monotonic_seconds();
     bool have_cpu_ticks_after = read_process_cpu_ticks(pid, &cpu_ticks_after);
@@ -2105,12 +2210,22 @@ static void send_profile_start(int fd, const char *query) {
         send_text_response(fd, 500, perf_error[0] ? perf_error : "perf is not installed or is not usable.\n");
         return;
     }
+    char access_error[512];
+    if (!check_process_profilable(pid, access_error, sizeof(access_error))) {
+        cleanup_temp_dir(temp_dir);
+        send_text_response(fd, 403, access_error);
+        return;
+    }
     const char *perf = g_perf_status_path[0] ? g_perf_status_path : find_perf_binary();
     snprintf(recording.perf_path, sizeof(recording.perf_path), "%s", perf);
     char frequency_text[32], pid_text[32];
     snprintf(frequency_text, sizeof(frequency_text), "%d", frequency);
     snprintf(pid_text, sizeof(pid_text), "%d", pid);
 
+    const char *arguments[] = {
+        recording.perf_path, "record", perf_namespaces_option(), "-e", "cpu-clock", "-F", frequency_text,
+        "-g", "--call-graph", "fp", "-p", pid_text, "-o", recording.perf_data, perf_callchain_option(), NULL
+    };
     pid_t child = fork();
     if (child < 0) {
         cleanup_temp_dir(temp_dir);
@@ -2125,17 +2240,7 @@ static void send_profile_start(int fd, const char *query) {
             dup2(log_fd, STDERR_FILENO);
             if (log_fd > STDERR_FILENO) close(log_fd);
         }
-        execlp(recording.perf_path,
-               recording.perf_path,
-               "record",
-               container_selected().id[0] ? "--no-namespaces" : "--namespaces",
-               "-e", "cpu-clock",
-               "-F", frequency_text,
-               "-g",
-               "--call-graph", "fp",
-               "-p", pid_text,
-               "-o", recording.perf_data,
-               (char *)NULL);
+        execvp(recording.perf_path, (char *const *)arguments);
         _exit(127);
     }
     setpgid(child, child);
