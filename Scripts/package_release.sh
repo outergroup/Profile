@@ -19,6 +19,13 @@ require_file() {
     fi
 }
 
+require_file "${REPO_ROOT}/VERSION"
+APP_VERSION="$(tr -d '[:space:]' < "${REPO_ROOT}/VERSION")"
+if [[ ! "${APP_VERSION}" =~ ^[0-9A-Za-z.+_-]+$ ]]; then
+    echo "error: ${REPO_ROOT}/VERSION must hold a version such as 1.1.0" >&2
+    exit 1
+fi
+
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/aarch64/ProfileBackend"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinaries/x86_64/ProfileBackend"
 require_file "${PACKAGE_ROOT}/RemoteLinuxBinariesMusl/aarch64/ProfileBackend"
@@ -73,6 +80,7 @@ package_linux_variant() {
     install -m 0644 "${REPO_ROOT}/app-icon.png" "${app_root}/web/app-icon.png"
     install -m 0644 "${REPO_ROOT}/Resources/ProfileWeb/app.css" "${app_root}/web/app.css"
     install -m 0644 "${REPO_ROOT}/Resources/ProfileWeb/app.js" "${app_root}/web/app.js"
+    printf '%s\n' "${APP_VERSION}" > "${app_root}/version"
     tar --format ustar --no-xattrs -C "${STAGING_ROOT}" -czf "${OUTPUT_APP_ROOT}/${output_name}.tar.gz" Profile
     echo "Packaged ${OUTPUT_APP_ROOT}/${output_name}.tar.gz"
 }

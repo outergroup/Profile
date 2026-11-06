@@ -504,6 +504,7 @@ private enum ProfileBinary {
 
 @MainActor
 private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLineTextInputControllerDelegate {
+    private lazy var elasticScrolling = ElasticScrollController(host: outerframeHost)
     private let outerframeHost: OuterframeHost
     private let appConnection: OuterframeAppConnection
     private var retainedSelf: ProfileHandler?
@@ -715,43 +716,46 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             self.appearance = appearance
             updateColors()
 
-        case .scrollWheelEvent(let point, let delta, _, _, _, let hasPreciseScrollingDeltas):
+        case .scrollWheelEvent(let point, let delta, _, let phase, let momentumPhase, let hasPreciseScrollingDeltas):
             guard !perfMachineUnsupported else { return }
             let multiplier: CGFloat = hasPreciseScrollingDeltas ? 1 : rowHeight
             if pendingFilePicker != nil {
-                if filePickerListFrame.contains(point) {
-                    setFilePickerScroll(filePickerScroll - delta.y * multiplier)
+                if elasticScrolling.isActive("picker") || filePickerListFrame.contains(point) {
+                    setFilePickerScroll(elasticScrolling.scroll("picker", by: -delta.y * multiplier, offset: filePickerScroll, maximum: max(filePickerContentHeight - filePickerListFrame.height, 0), viewport: filePickerListFrame.height, phase: phase, momentumPhase: momentumPhase, precise: hasPreciseScrollingDeltas, direction: 1) { [weak self] in self.map { [$0.filePickerRowsContentLayer] } ?? [] })
                 }
-            } else if showingSetup, processListLayer.frame.contains(point) {
-                processScroll -= delta.y * multiplier
+            } else if showingSetup, elasticScrolling.isActive("processes") || processListLayer.frame.contains(point) {
+                processScroll = elasticScrolling.scroll("processes", by: -delta.y * multiplier, offset: processScroll, maximum: max(CGFloat(processSearchText.isEmpty ? processes.count : filteredProcessIndices.count) * rowHeight - processViewportLayer.bounds.height, 0), viewport: processViewportLayer.bounds.height, phase: phase, momentumPhase: momentumPhase, precise: hasPreciseScrollingDeltas, direction: 1) { [weak self] in self.map { [$0.processContentLayer] } ?? [] }
                 clampProcessScroll()
                 updateProcessScrollPosition()
-            } else if sidebarLayer.frame.contains(point) {
+            } else if elasticScrolling.isActive("traces") || sidebarLayer.frame.contains(point) {
                 let sidebarPoint = sidebarLayer.convert(point, from: rootLayer)
-                if traceViewportLayer.frame.contains(sidebarPoint) {
-                    traceScroll -= delta.y * multiplier
+                if elasticScrolling.isActive("traces") || traceViewportLayer.frame.contains(sidebarPoint) {
+                    traceScroll = elasticScrolling.scroll("traces", by: -delta.y * multiplier, offset: traceScroll, maximum: max(CGFloat(traceRowCount()) * runRowHeight - traceViewportLayer.bounds.height, 0), viewport: traceViewportLayer.bounds.height, phase: phase, momentumPhase: momentumPhase, precise: hasPreciseScrollingDeltas, direction: 1) { [weak self] in self.map { [$0.traceContentLayer] } ?? [] }
                     clampTraceScroll()
                     updateTraceScrollPosition()
                 }
-            } else if !showingSetup, flameLayer.frame.contains(point) {
+            } else if !showingSetup, elasticScrolling.isActive("flame") || flameLayer.frame.contains(point) {
                 flameHorizontalScroll -= delta.x * multiplier
-                flameVerticalScroll -= delta.y * multiplier
+                flameVerticalScroll = elasticScrolling.scroll("flame", by: -delta.y * multiplier, offset: flameVerticalScroll, maximum: max(flameContentSize.height - flameGraphViewportRect().height, 0), viewport: flameGraphViewportRect().height, phase: phase, momentumPhase: momentumPhase, precise: hasPreciseScrollingDeltas, direction: 1) { [weak self] in self.map { [$0.flameBoxContentLayer, $0.flameTextOverlayLayer] } ?? [] }
                 clampFlameScroll()
                 hideTooltip()
                 updateFlameScrollPosition()
             }
 
         case .magnification(_, let magnification, let location, _):
+            elasticScrolling.reset()
             guard !perfMachineUnsupported else { return }
             handleMagnification(magnification, at: location)
 
         case .magnificationEnded(_, _, _, _):
+            elasticScrolling.reset()
             guard !perfMachineUnsupported else { return }
             clampFlameScroll()
             commitFlameZoomLayout()
             updateFlameScrollPosition()
 
         case .mouseDown(let point, let modifierFlags, let clickCount):
+            let point = elasticScrolling.finish(at: point, in: rootLayer)
             if perfMachineUnsupported {
                 if modifierFlags.contains(.control) {
                     showMachineUnsupportedContextMenu(at: point)
@@ -788,6 +792,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             handleMouseMoved(at: point)
 
         case .keyDown(let keyCode, let characters, let charactersIgnoringModifiers, let modifierFlags, let isARepeat):
+            elasticScrolling.reset()
             if perfMachineUnsupported {
                 handleMachineUnsupportedKeyDown(charactersIgnoringModifiers: charactersIgnoringModifiers,
                                                 modifierFlags: modifierFlags)
@@ -891,6 +896,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
             outerframeHost.sendAccessibilitySnapshotResponse(requestID: requestID, snapshot: accessibilitySnapshot())
 
         case .shutdown:
+            elasticScrolling.reset()
             retainedSelf = nil
 
         default:
@@ -899,6 +905,7 @@ private final class ProfileHandler: NSObject, OuterframeHostDelegate, SingleLine
     }
 
     func outerframeHostDidDisconnect(_ host: OuterframeHost) {
+        elasticScrolling.reset()
         retainedSelf = nil
     }
 
