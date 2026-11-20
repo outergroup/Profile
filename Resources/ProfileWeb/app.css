@@ -380,18 +380,6 @@ dialog::backdrop { background: #0005; }
   .flame-wrap > div:first-child { padding: 5px 0; font-size: 11px; line-height: 14px; }
 }
 
-@media (hover: none) and (pointer: coarse) {
-  :root { --outerloop-overlay-clearance: 18px; }
-}
-
-@media (hover: none) and (pointer: coarse) and (orientation: portrait) {
-  :root { --outerloop-overlay-clearance: 20px; }
-}
-
-@media (hover: none) and (pointer: coarse) and (orientation: landscape) {
-  :root { --outerloop-overlay-clearance: 16px; }
-}
-
 @media (prefers-reduced-motion: reduce) {
   aside, .drawer-scrim { transition: none; }
 }

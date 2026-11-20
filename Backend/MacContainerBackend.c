@@ -241,8 +241,15 @@ int main(int argc,char **argv) {
         else snprintf(state,sizeof(state),"%s/Library/Application Support/org.outershell.%s",home,APP_NAME);
     }
     if(mkdir(state,0700) && errno!=EEXIST) {perror(state);return 1;}
-    const char *candidates[]={"/usr/local/bin/docker","/opt/homebrew/bin/docker","/Applications/Docker.app/Contents/Resources/bin/docker",NULL};
+    char user_docker[PATH_MAX];snprintf(user_docker,sizeof(user_docker),"%s/.docker/bin/docker",home);
+    const char *candidates[]={"/usr/local/bin/docker","/opt/homebrew/bin/docker",user_docker,"/Applications/Docker.app/Contents/Resources/bin/docker",NULL};
     for(int i=0;candidates[i];i++) if(!access(candidates[i],X_OK)) {snprintf(docker,sizeof(docker),"%s",candidates[i]);break;}
+    if(*docker) {
+        char directory[PATH_MAX];snprintf(directory,sizeof(directory),"%s",docker);*strrchr(directory,'/')=0;
+        const char *inherited=getenv("PATH");
+        char search_path[3*PATH_MAX];snprintf(search_path,sizeof(search_path),"%s:/Applications/Docker.app/Contents/Resources/bin:%s",directory,inherited&&*inherited?inherited:"/usr/bin:/bin:/usr/sbin:/sbin");
+        setenv("PATH",search_path,1);
+    }
     snprintf(resource_directory,sizeof(resource_directory),"%s/..",bundles);
     signal(SIGPIPE,SIG_IGN);signal(SIGTERM,stop);signal(SIGINT,stop);
     registry_snapshot();pthread_t registry;pthread_create(&registry,NULL,refresh_registry,NULL);

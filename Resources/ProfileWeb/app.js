@@ -312,30 +312,41 @@
     }));
   }
 
-  async function refreshPerf(path) {
+  const backgroundFailures = new Map();
+
+  function staysQuiet(key, background) {
+    if (!background) return false;
+    if (!backgroundFailures.has(key)) backgroundFailures.set(key, Date.now());
+    return Date.now() - backgroundFailures.get(key) < 5000;
+  }
+
+  async function refreshPerf(path, background = false) {
     const query = path == null ? '' : '?' + new URLSearchParams({ path });
     if (path != null) setSetupStatus('Checking perf…');
     try {
       const response = await appFetch('/api/perf' + query);
       if (!response.ok) throw Error(await response.text());
       state.perf = parsePerf(await response.arrayBuffer());
+      backgroundFailures.delete('perf');
       if (document.activeElement !== $('#perfPath')) $('#perfPath').value = state.perf.path;
       $('#perfMessage').textContent = state.perf.message || (state.perf.usable ? 'perf is usable' : 'perf is not usable');
       $('#perfMessage').classList.toggle('error', !state.perf.usable);
       updateRecordingControls();
       if (path != null) setSetupStatus(state.perf.usable ? `Using ${state.perf.path}.` : state.perf.message);
     } catch (error) {
+      if (staysQuiet('perf', background)) return;
       $('#perfMessage').textContent = error.message || 'Could not check perf.';
       $('#perfMessage').classList.add('error');
       setSetupStatus(error.message || 'Could not check perf.');
     }
   }
 
-  async function refreshRuns() {
+  async function refreshRuns(background = false) {
     try {
       const response = await appFetch('/api/profiles?containers=1');
       if (!response.ok) throw Error(await response.text());
       const result = parseRuns(await response.arrayBuffer());
+      backgroundFailures.delete('runs');
       state.recording = result.recording;
       state.activeID = result.active;
       state.runs = result.runs;
@@ -343,6 +354,7 @@
       renderRuns();
       updateRecordingControls();
     } catch (error) {
+      if (staysQuiet('runs', background)) return;
       if (state.showingSetup) setSetupStatus(error.message || 'Could not load recordings.');
       else setProfileStatus(error.message || 'Could not load recordings.');
     }
@@ -966,8 +978,9 @@
   restoreTraceURL();
   Promise.all([refreshProcesses(), refreshPerf(), refreshRuns()]);
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && !state.perf.usable && !state.perf.machineUnsupported) refreshPerf();
+    if (!document.hidden && !state.perf.usable && !state.perf.machineUnsupported) refreshPerf(undefined, true);
+    if (!document.hidden && state.recording) refreshRuns(true);
   });
-  setInterval(() => { if (!state.perf.usable && !state.perf.machineUnsupported) refreshPerf(); }, 5000);
-  setInterval(() => { if (state.recording) refreshRuns(); }, 1000);
+  setInterval(() => { if (!state.perf.usable && !state.perf.machineUnsupported) refreshPerf(undefined, true); }, 5000);
+  setInterval(() => { if (state.recording) refreshRuns(true); }, 1000);
 })();
